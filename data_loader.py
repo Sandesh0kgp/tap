@@ -1,3 +1,4 @@
+
 import pandas as pd
 import logging
 from typing import Optional, Dict, List, Tuple
@@ -35,14 +36,17 @@ class DataLoader:
             # Process bond files
             if bond_files and any(bond_files):
                 bond_details, status["bond"] = self._process_bond_files(bond_files)
+                self.bond_details = bond_details
 
             # Process cashflow file
             if cashflow_file:
                 cashflow_details, status["cashflow"] = self._process_cashflow_file(cashflow_file)
+                self.cashflow_details = cashflow_details
 
             # Process company file
             if company_file:
                 company_insights, status["company"] = self._process_company_file(company_file)
+                self.company_insights = company_insights
 
         except Exception as e:
             self.logger.error(f"Error in load_data: {str(e)}")
@@ -249,7 +253,8 @@ class DataLoader:
         """Process JSON columns in DataFrame"""
         json_columns = [
             'coupon_details', 'issuer_details', 'instrument_details',
-            'redemption_details', 'credit_rating_details', 'listing_details'
+            'redemption_details', 'credit_rating_details', 'listing_details',
+            'key_contact_details', 'key_documents_details'
         ]
 
         for col in json_columns:
@@ -284,3 +289,48 @@ class DataLoader:
                 )
             ]
         return self.company_insights
+
+    def lookup_bond_by_isin(self, isin: str) -> Dict:
+        """Look up bond details by ISIN"""
+        try:
+            if self.bond_details is None:
+                return {"error": "Bond data not loaded"}
+                
+            # Try exact match
+            matching_bonds = self.bond_details[self.bond_details['isin'] == isin]
+            
+            if matching_bonds.empty:
+                # Try partial match
+                matching_bonds = self.bond_details[self.bond_details['isin'].str.contains(isin, case=False, na=False)]
+            
+            if not matching_bonds.empty:
+                bond_data = matching_bonds.iloc[0].to_dict()
+                
+                # Get cashflow data if available
+                cashflow_data = None
+                if self.cashflow_details is not None:
+                    cashflow = self.cashflow_details[
+                        self.cashflow_details['isin'] == matching_bonds.iloc[0]['isin']
+                    ]
+                    if not cashflow.empty:
+                        cashflow_data = cashflow.to_dict('records')
+                
+                # Get company data if available
+                company_data = None
+                if self.company_insights is not None:
+                    company = self.company_insights[
+                        self.company_insights['company_name'] == matching_bonds.iloc[0]['company_name']
+                    ]
+                    if not company.empty:
+                        company_data = company.iloc[0].to_dict()
+                
+                return {
+                    "bond_data": bond_data,
+                    "cashflow_data": cashflow_data,
+                    "company_data": company_data
+                }
+            
+            return {"error": f"No bond found with ISIN: {isin}"}
+        except Exception as e:
+            self.logger.error(f"Error looking up bond: {str(e)}")
+            return {"error": f"Error looking up bond: {str(e)}"}
