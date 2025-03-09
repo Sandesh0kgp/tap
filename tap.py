@@ -172,7 +172,6 @@ def load_data(bond_files, cashflow_file, company_file) -> Tuple[Optional[pd.Data
                         if not is_valid:
                             status["bond"]["status"] = "error"
                             status["bond"]["message"] = f"Bond file {i+1}: {validation_message}"
-
 def lookup_bond_by_isin(isin: str) -> Dict:
     """Look up bond details by ISIN"""
     try:
