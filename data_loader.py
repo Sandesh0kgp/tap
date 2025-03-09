@@ -9,6 +9,7 @@ from langchain.schema.output_parser import StrOutputParser
 from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from typing import Dict, List, Any, Tuple, Optional
 import json
+import tempfile
 import traceback
 import time
 import faiss
@@ -239,8 +240,8 @@ def process_query(query: str, context: Dict, llm) -> Dict:
 
         response = chain.invoke({
             "query": query,
-            "bond_data": str(bond_df.head(5)) if bond_df is not None else "No bond data available",
-            "cashflow_data": str(cashflow_df.head(5)) if cashflow_df is not None else "No cashflow data available",
+            "bond_data": str(context.get("bond_data").head(5)) if bond_df is not None else "No bond data available",
+            "cashflow_data": str(context.get("cashflow_data").head(5)) if cashflow_df is not None else "No cashflow data available",
             "company_data": str(context.get("company_data").head(5)) if context.get("company_data") is not None else "No company data available",
             "specific_bond_data": str(specific_bond_data) if specific_bond_data else "No specific bond data found",
             "specific_cashflow_data": str(specific_cashflow_data) if specific_cashflow_data else "No specific cashflow data found",
@@ -284,15 +285,16 @@ def main():
                 help="Choose the AI model for analysis"
             )
 
-            # Chunk size for data processing
+            # Chunk size for processing
             chunk_size = st.number_input(
                 "Processing Chunk Size",
                 min_value=1000,
                 max_value=100000,
                 value=50000,
-                step=1000,
+                step=5000,
                 help="Size of chunks for processing large files"
             )
+
             st.session_state.data_loader.set_chunk_size(chunk_size)
 
             # Data upload section
@@ -369,7 +371,7 @@ def main():
             # Bond Data Explorer tab
             with tabs[0]:
                 st.subheader("Look up bond by ISIN")
-                isin_input = st.text_input("", key="isin_lookup")
+                isin_input = st.text_input("Enter ISIN", key="isin_lookup")
 
                 if isin_input:
                     with st.spinner("Looking up bond details..."):
@@ -384,14 +386,22 @@ def main():
 
                             # Display bond details
                             st.markdown("### Bond Details")
-                            st.markdown(f"**ISIN:** {bond_data.get('isin', 'N/A')}")
-                            st.markdown(f"**Company:** {bond_data.get('company_name', 'N/A')}")
-                            st.markdown(f"**Issue Size:** {bond_data.get('issue_size', 'N/A')}")
+                            col1, col2 = st.columns(2)
+                            with col1:
+                                st.markdown(f"**ISIN:** {bond_data.get('isin', 'N/A')}")
+                                st.markdown(f"**Company:** {bond_data.get('company_name', 'N/A')}")
+                                st.markdown(f"**Issue Size:** {bond_data.get('issue_size', 'N/A')}")
+                            with col2:
+                                st.markdown(f"**Allotment Date:** {bond_data.get('allotment_date', 'N/A')}")
+                                st.markdown(f"**Maturity Date:** {bond_data.get('maturity_date', 'N/A')}")
 
                             # Display coupon details
                             st.markdown("### Coupon Details")
                             coupon_details = bond_data.get('coupon_details', {})
-                            st.json(coupon_details)
+                            if coupon_details:
+                                st.json(coupon_details)
+                            else:
+                                st.info("No coupon details available")
 
                             # Display company details if available
                             if company_data:
@@ -402,13 +412,20 @@ def main():
                             # Display cashflow details if available
                             if cashflow_data:
                                 st.markdown("### Cashflow Details")
-                                st.dataframe(pd.DataFrame(cashflow_data))
+                                cashflow_df = pd.DataFrame(cashflow_data)
+                                if 'cash_flow_date' in cashflow_df.columns:
+                                    cashflow_df['cash_flow_date'] = pd.to_datetime(cashflow_df['cash_flow_date'])
+                                    cashflow_df = cashflow_df.sort_values('cash_flow_date')
+                                st.dataframe(cashflow_df)
+                            else:
+                                st.info("No cashflow details available")
 
             # AI Query tab
             with tabs[1]:
                 query = st.text_input(
                     "Ask about bonds, companies, or market trends",
-                    placeholder="e.g., Show details for ISIN INE001A01001 or Find bonds with yield above 8%"
+                    placeholder="e.g., Show details for ISIN INE001A01001 or Find bonds with yield above 8%",
+                    key="ai_query"
                 )
 
                 if query:
@@ -416,37 +433,36 @@ def main():
                     llm = get_llm(api_key, model_option)
                     if not llm:
                         st.error("Please provide a valid GROQ API key to continue.")
-                        return
+                    else:
+                        with st.spinner("Processing your query..."):
+                            # Process query
+                            context = {
+                                "bond_data": st.session_state.bond_details,
+                                "cashflow_data": st.session_state.cashflow_details,
+                                "company_data": st.session_state.company_insights
+                            }
 
-                    with st.spinner("Processing your query..."):
-                        # Process query
-                        context = {
-                            "bond_data": st.session_state.bond_details,
-                            "cashflow_data": st.session_state.cashflow_details,
-                            "company_data": st.session_state.company_insights
-                        }
+                            result = process_query(query, context, llm)
 
-                        result = process_query(query, context, llm)
+                            if "error" in result:
+                                st.error(result["error"])
+                            else:
+                                # Display AI response
+                                st.markdown("### Analysis")
+                                st.markdown(result["response"])
 
-                        if "error" in result:
-                            st.error(result["error"])
-                        else:
-                            # Display AI response
-                            st.markdown("### Analysis")
-                            st.markdown(result["response"])
+                                # Display web search results
+                                if result.get("web_results"):
+                                    with st.expander("Web Search Results"):
+                                        for i, r in enumerate(result["web_results"], 1):
+                                            st.markdown(f"**{i}. [{r['title']}]({r['link']})**")
+                                            st.markdown(r['snippet'])
 
-                            # Display web search results
-                            if result.get("web_results"):
-                                with st.expander("Web Search Results"):
-                                    for i, r in enumerate(result["web_results"], 1):
-                                        st.markdown(f"**{i}. [{r['title']}]({r['link']})**")
-                                        st.markdown(r['snippet'])
-
-                            # Add to chat history
-                            st.session_state.chat_history.append({
-                                "query": query,
-                                "response": result["response"]
-                            })
+                                # Add to chat history
+                                st.session_state.chat_history.append({
+                                    "query": query,
+                                    "response": result["response"]
+                                })
 
             # Display chat history
             if st.session_state.chat_history:
