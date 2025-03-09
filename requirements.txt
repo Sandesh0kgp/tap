@@ -1,0 +1,14 @@
+langchain-community>=0.3.19
+langchain>=0.3.20
+langchain-groq>=0.2.5
+openai>=1.65.5
+pandas>=2.2.3
+plotly>=6.0.0
+streamlit>=1.43.1
+faiss-cpu>=1.10.0
+beautifulsoup4>=4.13.3
+requests>=2.32.3
+html2text>=2024.2.26
+numpy>=1.24.0
+python-dotenv>=1.0.0
+bs4>=0.0.1
