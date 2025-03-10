@@ -30,7 +30,7 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# Sample bond data as provided
+# Sample bond data (as fallback)
 SAMPLE_BOND_DATA = {
     "ISIN": "INE08XP07258",
     "Issuer": "AKARA CAPITAL ADVISORS PRIVATE LIMITED",
@@ -275,6 +275,8 @@ def load_data(bond_files, cashflow_file, company_file) -> Tuple[Optional[pd.Data
                         if not df.empty:
                             if 'isin' in df.columns:
                                 df['isin'] = df['isin'].astype(str)
+                            if 'coupon_rate' in df.columns:
+                                df['coupon_rate'] = df['coupon_rate'].astype(str).str.replace('%', '').astype(float)
                             json_columns = ['coupon_details', 'issuer_details', 'instrument_details']
                             df = process_json_columns(df, json_columns)
                             bond_dfs.append(df)
@@ -296,7 +298,7 @@ def load_data(bond_files, cashflow_file, company_file) -> Tuple[Optional[pd.Data
             if cashflow_path:
                 try:
                     is_valid, validation_message = validate_csv_file(
-                        cashflow_path, ['isin', 'cash_flow_date', 'cash_flow_amount']
+                        cashflow_path, ['isin', 'cash_flow_date']
                     )
                     if is_valid:
                         cashflow_details = pd.read_csv(cashflow_path)
@@ -384,7 +386,7 @@ def extract_cashflow_summary(data: List) -> str:
     if not data:
         return "No specific cashflow data found"
     
-    limited_data = data[:5]  # Show up to 5 cashflows
+    limited_data = data[:5]
     summarized = []
     
     for cf in limited_data:
@@ -399,25 +401,66 @@ def extract_cashflow_summary(data: List) -> str:
     
     return json.dumps(summarized, indent=2)
 
+def filter_bonds_by_coupon(bond_df: pd.DataFrame, min_coupon: float) -> List[Dict]:
+    """Filter bonds with coupon rate above a specified threshold"""
+    try:
+        if 'coupon_rate' not in bond_df.columns:
+            return []
+        
+        # Convert coupon_rate to float, handling strings with % if necessary
+        bond_df['coupon_rate'] = pd.to_numeric(
+            bond_df['coupon_rate'].astype(str).str.replace('%', ''),
+            errors='coerce'
+        )
+        
+        filtered_bonds = bond_df[bond_df['coupon_rate'] > min_coupon]
+        return filtered_bonds.to_dict('records')
+    except Exception as e:
+        logger.error(f"Error filtering bonds: {str(e)}")
+        return []
+
 def process_query(query: str, context: Dict, llm) -> Dict:
     try:
         if not llm:
             return {"error": "AI model not initialized. Please check API key."}
 
+        bond_df = context.get("bond_data")
+        response_text = ""
+        
+        # Handle specific filtering query like "Find bonds with coupon rate above 8%"
+        if "coupon rate above" in query.lower():
+            try:
+                min_coupon = float(query.lower().split("coupon rate above")[1].split("%")[0].strip())
+                filtered_bonds = filter_bonds_by_coupon(bond_df, min_coupon)
+                
+                if filtered_bonds:
+                    response_text = f"### Bonds with Coupon Rate Above {min_coupon}%\n\n"
+                    response_text += f"Found {len(filtered_bonds)} bonds matching your criteria:\n\n"
+                    for bond in filtered_bonds[:10]:  # Limit to top 10 for brevity
+                        response_text += f"- **ISIN:** {bond.get('isin', 'N/A')}  \n"
+                        response_text += f"  **Company:** {bond.get('company_name', 'N/A')}  \n"
+                        response_text += f"  **Coupon Rate:** {bond.get('coupon_rate', 'N/A')}%  \n"
+                        response_text += f"  **Face Value:** {bond.get('face_value', 'N/A')}  \n\n"
+                    if len(filtered_bonds) > 10:
+                        response_text += f"*Showing top 10 of {len(filtered_bonds)} matches.*\n"
+                else:
+                    response_text = f"### Bonds with Coupon Rate Above {min_coupon}%\n\nNo bonds found with a coupon rate above {min_coupon}% in the loaded data."
+                return {"response": response_text, "web_results": []}
+            except ValueError:
+                pass  # Fall back to LLM if parsing fails
+
+        # Handle ISIN-specific queries
         isin_query = query.strip().upper()
         specific_bond_data = None
-        
         if (len(isin_query) >= 5 and "bond_data" in context) or "ISIN" in isin_query:
             if "ISIN" in isin_query:
                 import re
                 isin_pattern = re.search(r'[A-Z0-9]{5,}', isin_query)
                 if isin_pattern:
                     isin_query = isin_pattern.group(0)
-            
             specific_bond_data = lookup_bond_by_isin(isin_query)
 
         web_results = perform_web_search(query, num_results=1)
-        
         web_snippets = []
         for result in web_results:
             web_snippets.append({
@@ -538,10 +581,11 @@ def main():
 
         if st.session_state.bond_details is not None:
             with st.expander("Debug Information (Data Overview)"):
-                st.write("Bond Data Sample:")
-                st.dataframe(st.session_state.bond_details)
-                st.write("Cashflow Data Sample (first 5 rows):")
-                st.dataframe(st.session_state.cashflow_details.head(5))
+                st.write("Bond Data Sample (first 3 rows):")
+                st.dataframe(st.session_state.bond_details.head(3))
+                if st.session_state.cashflow_details is not None:
+                    st.write("Cashflow Data Sample (first 3 rows):")
+                    st.dataframe(st.session_state.cashflow_details.head(3))
 
         if any(value["status"] == "success" for value in st.session_state.data_loading_status.values()):
             tabs = st.tabs(["Bond Data Explorer", "AI Query"])
@@ -580,7 +624,7 @@ def main():
             with tabs[1]:
                 query = st.text_input(
                     "Ask about bonds, companies, or market trends",
-                    placeholder="e.g., Show details for ISIN INE08XP07258",
+                    placeholder="e.g., Find bonds with coupon rate above 8%",
                     label_visibility="collapsed"
                 )
                 
@@ -626,8 +670,8 @@ def main():
             st.markdown("""
             ### Bond Analysis
             - Show details for ISIN INE08XP07258
+            - Find bonds with coupon rate above 8%
             - Find bonds with yield above 15%
-            - What are the upcoming payments for INE08XP07258?
 
             ### Cash Flow Analysis
             - Show cashflows for ISIN INE08XP07258 in 2025
