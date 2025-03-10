@@ -146,20 +146,38 @@ def process_json_columns(df: pd.DataFrame, json_columns: List[str]) -> pd.DataFr
     return df
 
 def lookup_bond_by_isin(isin: str) -> Dict:
-    """Look up bond details by ISIN"""
+    """Look up bond details by ISIN - Improved version with better partial matching"""
     try:
         if st.session_state.bond_details is None:
             return {"error": "Bond data not loaded"}
             
         bond_df = st.session_state.bond_details
-        # Try exact match
+        isin = isin.strip().upper()
+        
+        # Try exact match first
         matching_bonds = bond_df[bond_df['isin'] == isin]
         
+        # If no exact match, try progressive partial matching
         if matching_bonds.empty:
-            # Try partial match
+            # Try contains match (case-insensitive)
             matching_bonds = bond_df[bond_df['isin'].str.contains(isin, case=False, na=False)]
+            
+            # If still no match, try if the search term is contained in any ISIN
+            if matching_bonds.empty:
+                # For each character in the search term, gradually build potential matches
+                min_match_length = min(5, len(isin))  # At least 5 chars or full ISIN if shorter
+                for i in range(min_match_length, len(isin) + 1):
+                    partial_isin = isin[:i]
+                    matching_bonds = bond_df[bond_df['isin'].str.contains(partial_isin, case=False, na=False)]
+                    if not matching_bonds.empty:
+                        break
         
         if not matching_bonds.empty:
+            # Log found matches for debugging
+            logger.info(f"Found {len(matching_bonds)} matches for ISIN '{isin}'")
+            for idx, match in matching_bonds.iterrows():
+                logger.info(f"Match: {match['isin']} - {match['company_name']}")
+            
             bond_data = matching_bonds.iloc[0].to_dict()
             
             # Get cashflow data if available
@@ -183,12 +201,13 @@ def lookup_bond_by_isin(isin: str) -> Dict:
             return {
                 "bond_data": bond_data,
                 "cashflow_data": cashflow_data,
-                "company_data": company_data
+                "company_data": company_data,
+                "matches": len(matching_bonds)
             }
         
         return {"error": f"No bond found with ISIN: {isin}"}
     except Exception as e:
-        logger.error(f"Error looking up bond: {str(e)}")
+        logger.error(f"Error looking up bond: {str(e)}\n{traceback.format_exc()}")
         return {"error": f"Error looking up bond: {str(e)}"}
 
 def load_data(bond_files, cashflow_file, company_file) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Dict]]:
@@ -222,6 +241,10 @@ def load_data(bond_files, cashflow_file, company_file) -> Tuple[Optional[pd.Data
 
                         df = pd.read_csv(bond_path)
                         if not df.empty:
+                            # Ensure ISIN is string type for proper matching
+                            if 'isin' in df.columns:
+                                df['isin'] = df['isin'].astype(str)
+                            
                             json_columns = ['coupon_details', 'issuer_details', 'instrument_details']
                             df = process_json_columns(df, json_columns)
                             bond_dfs.append(df)
@@ -249,6 +272,10 @@ def load_data(bond_files, cashflow_file, company_file) -> Tuple[Optional[pd.Data
                     if is_valid:
                         cashflow_details = pd.read_csv(cashflow_path)
                         if not cashflow_details.empty:
+                            # Ensure ISIN is string type for proper matching
+                            if 'isin' in cashflow_details.columns:
+                                cashflow_details['isin'] = cashflow_details['isin'].astype(str)
+                            
                             status["cashflow"]["status"] = "success"
                             status["cashflow"]["message"] = f"Loaded {len(cashflow_details)} records"
                     else:
@@ -326,8 +353,15 @@ def process_query(query: str, context: Dict, llm) -> Dict:
         bond_df = context.get("bond_data")
         cashflow_df = context.get("cashflow_data")
         
-        # If query looks like an ISIN, try to extract specific bond data
-        if len(isin_query) >= 10 and bond_df is not None:
+        # If query looks like an ISIN or contains ISIN-like pattern, try to extract specific bond data
+        if (len(isin_query) >= 5 and bond_df is not None) or "ISIN" in isin_query:
+            # Try to extract ISIN pattern if query contains words
+            if "ISIN" in isin_query:
+                import re
+                isin_pattern = re.search(r'[A-Z0-9]{5,}', isin_query)
+                if isin_pattern:
+                    isin_query = isin_pattern.group(0)
+            
             # Try exact match first
             if isin_query in bond_df['isin'].values:
                 specific_bond_data = bond_df[bond_df['isin'] == isin_query].to_dict('records')
@@ -335,12 +369,17 @@ def process_query(query: str, context: Dict, llm) -> Dict:
                     specific_cashflow_data = cashflow_df[cashflow_df['isin'] == isin_query].to_dict('records')
             # Try partial match
             else:
-                matching_bonds = bond_df[bond_df['isin'].str.contains(isin_query, case=False, na=False)]
-                if not matching_bonds.empty:
-                    specific_bond_data = matching_bonds.to_dict('records')
-                    if cashflow_df is not None:
-                        matching_isins = matching_bonds['isin'].tolist()
-                        specific_cashflow_data = cashflow_df[cashflow_df['isin'].isin(matching_isins)].to_dict('records')
+                # For each character in the search term, gradually build potential matches
+                min_match_length = min(5, len(isin_query))  # At least 5 chars or full ISIN if shorter
+                for i in range(min_match_length, len(isin_query) + 1):
+                    partial_isin = isin_query[:i]
+                    matching_bonds = bond_df[bond_df['isin'].str.contains(partial_isin, case=False, na=False)]
+                    if not matching_bonds.empty:
+                        specific_bond_data = matching_bonds.to_dict('records')
+                        if cashflow_df is not None:
+                            matching_isins = matching_bonds['isin'].tolist()
+                            specific_cashflow_data = cashflow_df[cashflow_df['isin'].isin(matching_isins)].to_dict('records')
+                        break
 
         # Perform web search for additional context
         web_results = perform_web_search(query)
@@ -365,6 +404,8 @@ def process_query(query: str, context: Dict, llm) -> Dict:
         Please provide a comprehensive analysis based on all available information.
         Format your response using Markdown for better readability.
         Include relevant web information when appropriate.
+        If the user is looking for a specific bond by ISIN, make sure to include all relevant details
+        about that bond including issuer, coupon rate, maturity, and other key information.
         """
 
         prompt = ChatPromptTemplate.from_template(template)
@@ -484,6 +525,18 @@ def main():
         st.markdown("### Data Status")
         display_status()
 
+        # Debug information (can be toggled in production)
+        if st.session_state.bond_details is not None:
+            with st.expander("Debug Information (Data Overview)"):
+                st.write("Bond Data Sample (first 3 rows):")
+                st.dataframe(st.session_state.bond_details.head(3))
+                if st.session_state.bond_details is not None:
+                    unique_isins = st.session_state.bond_details['isin'].nunique()
+                    st.write(f"Total ISINs in database: {unique_isins}")
+                    # Show list of ISINs for debugging
+                    st.write("ISIN Samples (first 20):")
+                    st.write(", ".join(st.session_state.bond_details['isin'].astype(str).unique()[:20]))
+
         # Add Bond Explorer
         if any(value["status"] == "success" for value in st.session_state.data_loading_status.values()):
             tabs = st.tabs(["Bond Data Explorer", "AI Query"])
@@ -491,7 +544,9 @@ def main():
             # Bond Data Explorer tab
             with tabs[0]:
                 st.subheader("Look up bond by ISIN")
-                isin_input = st.text_input("Enter ISIN", key="isin_lookup", label_visibility="collapsed")
+                isin_input = st.text_input("Enter ISIN", key="isin_lookup", 
+                                           placeholder="Enter full or partial ISIN code",
+                                           help="You can enter a partial ISIN - the system will find matching bonds")
                 
                 if isin_input:
                     with st.spinner("Looking up bond details..."):
@@ -500,6 +555,10 @@ def main():
                         if "error" in bond_result:
                             st.error(bond_result["error"])
                         else:
+                            # If multiple matches were found, show info about it
+                            if bond_result.get("matches", 1) > 1:
+                                st.info(f"Found {bond_result.get('matches')} bonds matching '{isin_input}'. Showing the first match.")
+                            
                             bond_data = bond_result.get("bond_data", {})
                             cashflow_data = bond_result.get("cashflow_data", [])
                             company_data = bond_result.get("company_data", {})
@@ -510,16 +569,15 @@ def main():
                             st.markdown(f"**Company:** {bond_data.get('company_name', 'N/A')}")
                             st.markdown(f"**Issue Size:** {bond_data.get('issue_size', 'N/A')}")
                             
-                            # Display coupon details
-                            st.markdown("### Coupon Details")
-                            coupon_details = bond_data.get('coupon_details', {})
-                            st.json(coupon_details)
+                            # Display bond data in JSON format
+                            st.json(bond_data)
                             
                             # Display company details if available
                             if company_data:
                                 st.markdown("### Company Details")
                                 st.markdown(f"**Company:** {company_data.get('company_name', 'N/A')}")
                                 st.markdown(f"**Industry:** {company_data.get('industry', 'N/A')}")
+                                st.json(company_data)
                             
                             # Display cashflow details if available
                             if cashflow_data:
@@ -548,6 +606,22 @@ def main():
                             "cashflow_data": st.session_state.cashflow_details,
                             "company_data": st.session_state.company_insights
                         }
+
+                        # First, check if this is a direct ISIN lookup
+                        if "ISIN" in query.upper():
+                            # Extract potential ISIN from query
+                            import re
+                            isin_pattern = re.search(r'[A-Z0-9]{5,}', query.upper())
+                            if isin_pattern:
+                                isin_query = isin_pattern.group(0)
+                                # Try direct lookup first
+                                bond_result = lookup_bond_by_isin(isin_query)
+                                if "error" not in bond_result:
+                                    # If direct lookup succeeds, add this information
+                                    st.markdown(f"### Bond Found: {bond_result['bond_data'].get('isin', 'N/A')}")
+                                    st.markdown(f"**Company:** {bond_result['bond_data'].get('company_name', 'N/A')}")
+                                    if "matches" in bond_result and bond_result["matches"] > 1:
+                                        st.info(f"Found {bond_result['matches']} bonds matching '{isin_query}'. Showing information for the best match.")
 
                         result = process_query(query, context, llm)
 
