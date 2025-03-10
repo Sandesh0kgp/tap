@@ -17,7 +17,6 @@ import requests
 from bs4 import BeautifulSoup
 import html2text
 from datetime import datetime
-from data_loader import DataLoader
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
@@ -57,8 +56,6 @@ if "search_results" not in st.session_state:
     st.session_state.search_results = {}
 if "web_cache" not in st.session_state:
     st.session_state.web_cache = {}
-if "data_loader" not in st.session_state:
-    st.session_state.data_loader = DataLoader()
 
 # Vector store for efficient similarity search
 class VectorStore:
@@ -118,51 +115,140 @@ def perform_web_search(query: str, num_results: int = 3) -> List[Dict]:
         logger.error(f"Error in web search: {str(e)}")
         return []
 
-def lookup_bond_by_isin(isin: str) -> Dict:
-    """Look up bond details by ISIN"""
+def save_uploadedfile(uploadedfile):
+    """Save uploaded file to a temporary location"""
     try:
-        if st.session_state.bond_details is None:
-            return {"error": "Bond data not loaded"}
-
-        bond_df = st.session_state.bond_details
-        # Try exact match
-        matching_bonds = bond_df[bond_df['isin'] == isin]
-
-        if matching_bonds.empty:
-            # Try partial match
-            matching_bonds = bond_df[bond_df['isin'].str.contains(isin, case=False, na=False)]
-
-        if not matching_bonds.empty:
-            bond_data = matching_bonds.iloc[0].to_dict()
-
-            # Get cashflow data if available
-            cashflow_data = None
-            if st.session_state.cashflow_details is not None:
-                cashflow = st.session_state.cashflow_details[
-                    st.session_state.cashflow_details['isin'] == matching_bonds.iloc[0]['isin']
-                ]
-                if not cashflow.empty:
-                    cashflow_data = cashflow.to_dict('records')
-
-            # Get company data if available
-            company_data = None
-            if st.session_state.company_insights is not None:
-                company = st.session_state.company_insights[
-                    st.session_state.company_insights['company_name'] == matching_bonds.iloc[0]['company_name']
-                ]
-                if not company.empty:
-                    company_data = company.iloc[0].to_dict()
-
-            return {
-                "bond_data": bond_data,
-                "cashflow_data": cashflow_data,
-                "company_data": company_data
-            }
-
-        return {"error": f"No bond found with ISIN: {isin}"}
+        if uploadedfile is not None:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as f:
+                f.write(uploadedfile.getvalue())
+                return f.name
     except Exception as e:
-        logger.error(f"Error looking up bond: {str(e)}")
-        return {"error": f"Error looking up bond: {str(e)}"}
+        logger.error(f"Error saving file: {str(e)}")
+    return None
+
+def validate_csv_file(file_path: str, expected_columns: List[str]) -> Tuple[bool, str]:
+    """Validate CSV file format"""
+    try:
+        df_header = pd.read_csv(file_path, nrows=0)
+        missing_columns = [col for col in expected_columns if col not in df_header.columns]
+        if missing_columns:
+            return False, f"Missing columns: {', '.join(missing_columns)}"
+        return True, "File validated successfully"
+    except Exception as e:
+        return False, f"Error validating file: {str(e)}"
+
+def process_json_columns(df: pd.DataFrame, json_columns: List[str]) -> pd.DataFrame:
+    """Process JSON columns in DataFrame"""
+    for col in json_columns:
+        if col in df.columns:
+            df[col] = df[col].apply(lambda x: 
+                json.loads(x) if isinstance(x, str) and x.strip() else {})
+    return df
+
+def load_data(bond_files, cashflow_file, company_file) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Dict]]:
+    """Load all data files with error handling"""
+    status = {
+        "bond": {"status": "not_started", "message": ""},
+        "cashflow": {"status": "not_started", "message": ""},
+        "company": {"status": "not_started", "message": ""}
+    }
+
+    try:
+        # Process bond files
+        bond_dfs = []
+        if bond_files and any(bond_files):
+            status["bond"]["status"] = "in_progress"
+
+            for i, bf in enumerate(bond_files):
+                if bf is None:
+                    continue
+
+                bond_path = save_uploadedfile(bf)
+                if bond_path:
+                    try:
+                        is_valid, validation_message = validate_csv_file(
+                            bond_path, ['isin', 'company_name']
+                        )
+                        if not is_valid:
+                            status["bond"]["status"] = "error"
+                            status["bond"]["message"] = f"Bond file {i+1}: {validation_message}"
+                            continue
+
+                        df = pd.read_csv(bond_path)
+                        if not df.empty:
+                            json_columns = ['coupon_details', 'issuer_details', 'instrument_details']
+                            df = process_json_columns(df, json_columns)
+                            bond_dfs.append(df)
+                    finally:
+                        try:
+                            os.unlink(bond_path)
+                        except Exception:
+                            pass
+
+        bond_details = pd.concat(bond_dfs, ignore_index=True) if bond_dfs else None
+        if bond_details is not None:
+            status["bond"]["status"] = "success"
+            status["bond"]["message"] = f"Loaded {len(bond_details)} bonds"
+
+        # Process cashflow file
+        cashflow_details = None
+        if cashflow_file:
+            status["cashflow"]["status"] = "in_progress"
+            cashflow_path = save_uploadedfile(cashflow_file)
+            if cashflow_path:
+                try:
+                    is_valid, validation_message = validate_csv_file(
+                        cashflow_path, ['isin', 'cash_flow_date', 'cash_flow_amount']
+                    )
+                    if is_valid:
+                        cashflow_details = pd.read_csv(cashflow_path)
+                        if not cashflow_details.empty:
+                            status["cashflow"]["status"] = "success"
+                            status["cashflow"]["message"] = f"Loaded {len(cashflow_details)} records"
+                    else:
+                        status["cashflow"]["status"] = "error"
+                        status["cashflow"]["message"] = validation_message
+                finally:
+                    try:
+                        os.unlink(cashflow_path)
+                    except Exception:
+                        pass
+
+        # Process company file
+        company_insights = None
+        if company_file:
+            status["company"]["status"] = "in_progress"
+            company_path = save_uploadedfile(company_file)
+            if company_path:
+                try:
+                    is_valid, validation_message = validate_csv_file(
+                        company_path, ['company_name']
+                    )
+                    if is_valid:
+                        company_insights = pd.read_csv(company_path)
+                        json_columns = ['key_metrics', 'income_statement', 'balance_sheet', 'cashflow']
+                        company_insights = process_json_columns(company_insights, json_columns)
+                        if not company_insights.empty:
+                            status["company"]["status"] = "success"
+                            status["company"]["message"] = f"Loaded {len(company_insights)} companies"
+                    else:
+                        status["company"]["status"] = "error"
+                        status["company"]["message"] = validation_message
+                finally:
+                    try:
+                        os.unlink(company_path)
+                    except Exception:
+                        pass
+
+        return bond_details, cashflow_details, company_insights, status
+
+    except Exception as e:
+        logger.error(f"Error loading data: {str(e)}")
+        for key in status:
+            if status[key]["status"] in ["not_started", "in_progress"]:
+                status[key]["status"] = "error"
+                status[key]["message"] = "Unexpected error during processing"
+        return None, None, None, status
 
 @st.cache_resource
 def get_llm(api_key: str, model: str = "llama3-70b-8192"):
@@ -262,7 +348,7 @@ def display_status():
     cols = st.columns(len(st.session_state.data_loading_status))
     for col, (key, value) in zip(cols, st.session_state.data_loading_status.items()):
         with col:
-            status_icon = "✅" if value["status"] == "success" else "❌" if value["status"] == "error" else "⏳"
+            status_icon = "✅" if value["status"] == "success" else "❌"
             st.markdown(f"{status_icon} **{key.title()}:** {value['message']}")
 
 def main():
@@ -284,18 +370,6 @@ def main():
                 ["llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768"],
                 help="Choose the AI model for analysis"
             )
-
-            # Chunk size for processing
-            chunk_size = st.number_input(
-                "Processing Chunk Size",
-                min_value=1000,
-                max_value=100000,
-                value=50000,
-                step=5000,
-                help="Size of chunks for processing large files"
-            )
-
-            st.session_state.data_loader.set_chunk_size(chunk_size)
 
             # Data upload section
             st.markdown("### Data Management")
@@ -335,8 +409,8 @@ def main():
             # Load data button
             if st.button("Load Data", type="primary"):
                 with st.spinner("Processing data files..."):
-                    bond_details, cashflow_details, company_insights, status = st.session_state.data_loader.load_data(
-                        bond_files, cashflow_file, company_file, chunk_size
+                    bond_details, cashflow_details, company_insights, status = load_data(
+                        bond_files, cashflow_file, company_file
                     )
 
                     # Update session state
@@ -371,7 +445,7 @@ def main():
             # Bond Data Explorer tab
             with tabs[0]:
                 st.subheader("Look up bond by ISIN")
-                isin_input = st.text_input("Enter ISIN", key="isin_lookup")
+                isin_input = st.text_input("", key="isin_lookup")
 
                 if isin_input:
                     with st.spinner("Looking up bond details..."):
@@ -386,22 +460,14 @@ def main():
 
                             # Display bond details
                             st.markdown("### Bond Details")
-                            col1, col2 = st.columns(2)
-                            with col1:
-                                st.markdown(f"**ISIN:** {bond_data.get('isin', 'N/A')}")
-                                st.markdown(f"**Company:** {bond_data.get('company_name', 'N/A')}")
-                                st.markdown(f"**Issue Size:** {bond_data.get('issue_size', 'N/A')}")
-                            with col2:
-                                st.markdown(f"**Allotment Date:** {bond_data.get('allotment_date', 'N/A')}")
-                                st.markdown(f"**Maturity Date:** {bond_data.get('maturity_date', 'N/A')}")
+                            st.markdown(f"**ISIN:** {bond_data.get('isin', 'N/A')}")
+                            st.markdown(f"**Company:** {bond_data.get('company_name', 'N/A')}")
+                            st.markdown(f"**Issue Size:** {bond_data.get('issue_size', 'N/A')}")
 
                             # Display coupon details
                             st.markdown("### Coupon Details")
                             coupon_details = bond_data.get('coupon_details', {})
-                            if coupon_details:
-                                st.json(coupon_details)
-                            else:
-                                st.info("No coupon details available")
+                            st.json(coupon_details)
 
                             # Display company details if available
                             if company_data:
@@ -413,10 +479,13 @@ def main():
                             if cashflow_data:
                                 st.markdown("### Cashflow Details")
                                 cashflow_df = pd.DataFrame(cashflow_data)
-                                if 'cash_flow_date' in cashflow_df.columns:
-                                    cashflow_df['cash_flow_date'] = pd.to_datetime(cashflow_df['cash_flow_date'])
-                                    cashflow_df = cashflow_df.sort_values('cash_flow_date')
-                                st.dataframe(cashflow_df)
+
+                                # Import cashflow display agent
+                                from agents.cashflow_display_agent import CashflowDisplayAgent
+                                cashflow_display = CashflowDisplayAgent()
+
+                                # Display cashflow with enhanced formatting
+                                cashflow_display.display_cashflow_summary(cashflow_df, bond_data)
                             else:
                                 st.info("No cashflow details available")
 
@@ -424,8 +493,7 @@ def main():
             with tabs[1]:
                 query = st.text_input(
                     "Ask about bonds, companies, or market trends",
-                    placeholder="e.g., Show details for ISIN INE001A01001 or Find bonds with yield above 8%",
-                    key="ai_query"
+                    placeholder="e.g., Show details for ISIN INE001A01001 or Find bonds with yield above 8%"
                 )
 
                 if query:
@@ -433,36 +501,37 @@ def main():
                     llm = get_llm(api_key, model_option)
                     if not llm:
                         st.error("Please provide a valid GROQ API key to continue.")
-                    else:
-                        with st.spinner("Processing your query..."):
-                            # Process query
-                            context = {
-                                "bond_data": st.session_state.bond_details,
-                                "cashflow_data": st.session_state.cashflow_details,
-                                "company_data": st.session_state.company_insights
-                            }
+                        return
 
-                            result = process_query(query, context, llm)
+                    with st.spinner("Processing your query..."):
+                        # Process query
+                        context = {
+                            "bond_data": st.session_state.bond_details,
+                            "cashflow_data": st.session_state.cashflow_details,
+                            "company_data": st.session_state.company_insights
+                        }
 
-                            if "error" in result:
-                                st.error(result["error"])
-                            else:
-                                # Display AI response
-                                st.markdown("### Analysis")
-                                st.markdown(result["response"])
+                        result = process_query(query, context, llm)
 
-                                # Display web search results
-                                if result.get("web_results"):
-                                    with st.expander("Web Search Results"):
-                                        for i, r in enumerate(result["web_results"], 1):
-                                            st.markdown(f"**{i}. [{r['title']}]({r['link']})**")
-                                            st.markdown(r['snippet'])
+                        if "error" in result:
+                            st.error(result["error"])
+                        else:
+                            # Display AI response
+                            st.markdown("### Analysis")
+                            st.markdown(result["response"])
 
-                                # Add to chat history
-                                st.session_state.chat_history.append({
-                                    "query": query,
-                                    "response": result["response"]
-                                })
+                            # Display web search results
+                            if result.get("web_results"):
+                                with st.expander("Web Search Results"):
+                                    for i, r in enumerate(result["web_results"], 1):
+                                        st.markdown(f"**{i}. [{r['title']}]({r['link']})**")
+                                        st.markdown(r['snippet'])
+
+                            # Add to chat history
+                            st.session_state.chat_history.append({
+                                "query": query,
+                                "response": result["response"]
+                            })
 
             # Display chat history
             if st.session_state.chat_history:
