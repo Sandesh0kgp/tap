@@ -6,16 +6,10 @@ import numpy as np
 from langchain_groq import ChatGroq
 from langchain.prompts import ChatPromptTemplate
 from langchain.schema.output_parser import StrOutputParser
-from langchain_community.utilities import DuckDuckGoSearchAPIWrapper
 from typing import Dict, List, Any, Tuple, Optional
 import json
 import tempfile
 import traceback
-import time
-import faiss
-import requests
-from bs4 import BeautifulSoup
-import html2text
 from datetime import datetime
 
 # Configure logging
@@ -24,13 +18,13 @@ logger = logging.getLogger(__name__)
 
 # Set page config
 st.set_page_config(
-    page_title="Tap Bonds AI Platform",
+    page_title="Tap Bonds AI Hackathon",
     page_icon="📊",
     layout="wide",
     initial_sidebar_state="expanded"
 )
 
-# Sample bond data (as fallback)
+# Sample bond data (fallback)
 SAMPLE_BOND_DATA = {
     "ISIN": "INE08XP07258",
     "Issuer": "AKARA CAPITAL ADVISORS PRIVATE LIMITED",
@@ -51,10 +45,6 @@ SAMPLE_BOND_DATA = {
         {"Date": "22-Feb-2026", "Record Date": "07-Feb-2026", "Principal Amount": 2000000, "Interest Amount": 17003.2}
     ],
     "Face Value": 100000.00,
-    "Face Value After PO": 100000.00,
-    "Trade FV": 2000000,
-    "Units": 20,
-    "Trade Date": "03-Mar-2025",
     "YTM": "15.1000%",
     "Coupon": "10.0100%",
     "NPV": 1929967.33,
@@ -62,11 +52,9 @@ SAMPLE_BOND_DATA = {
     "Clean Price": 96.2515,
     "Dirty Price": 96.4984,
     "Consideration": 1929966.44,
-    "Stamp Duty": 2,
     "Total Consideration": 1929968.44
 }
 
-# Convert sample data to DataFrame format
 bond_df = pd.DataFrame({
     "isin": [SAMPLE_BOND_DATA["ISIN"]],
     "company_name": [SAMPLE_BOND_DATA["Issuer"]],
@@ -74,7 +62,9 @@ bond_df = pd.DataFrame({
     "ytm": [SAMPLE_BOND_DATA["YTM"]],
     "coupon_rate": [SAMPLE_BOND_DATA["Coupon"]],
     "npv": [SAMPLE_BOND_DATA["NPV"]],
-    "trade_date": [SAMPLE_BOND_DATA["Trade Date"]]
+    "credit_rating": ["AA"],
+    "maturity_date": ["22-Feb-2026"],
+    "security_type": ["Secured"]
 })
 
 cashflow_df = pd.DataFrame(SAMPLE_BOND_DATA["Cashflow"])
@@ -86,6 +76,40 @@ cashflow_df.rename(columns={
     "Interest Amount": "interest_amount"
 }, inplace=True)
 
+# Mock additional data for demo
+mock_bond_df = pd.DataFrame({
+    "isin": ["INE123456789", "INE987654321"],
+    "company_name": ["UGRO CAPITAL PRIVATE LIMITED", "UGRO CAPITAL PRIVATE LIMITED"],
+    "face_value": [100000, 1000000],
+    "ytm": ["9.2%", "10.0%"],
+    "coupon_rate": ["9.2%", "10.0%"],
+    "npv": [95000, 980000],
+    "credit_rating": ["AAA", "AA+"],
+    "maturity_date": ["10-12-2027", "05-09-2030"],
+    "security_type": ["Secured", "Secured"]
+})
+bond_df = pd.concat([bond_df, mock_bond_df], ignore_index=True)
+
+mock_finder_df = pd.DataFrame({
+    "isin": ["INE123456789", "INE987654321"],
+    "company_name": ["TATA CAPITAL", "INDIABULLS HOUSING FINANCE"],
+    "credit_rating": ["AAA", "AA"],
+    "yield_range": ["7.5%-8.0%", "9.2%-9.8%"],
+    "platform": ["SMEST", "FixedIncome & SMEST"]
+})
+
+mock_screener_df = pd.DataFrame({
+    "company_name": ["UGRO CAPITAL PRIVATE LIMITED", "ABC COMPANY"],
+    "sector": ["Financial Services", "Financial Services"],
+    "industry": ["NBFC", "Banking"],
+    "credit_rating": ["AA+", "A"],
+    "eps": [5.2, 3.8],
+    "current_ratio": [1.5, 1.2],
+    "debt_equity": [0.8, 1.1],
+    "debt_ebitda": [2.5, 3.0],
+    "interest_coverage": [4.0, 3.5]
+})
+
 # Initialize session state
 if "chat_history" not in st.session_state:
     st.session_state.chat_history = []
@@ -93,263 +117,17 @@ if "bond_details" not in st.session_state:
     st.session_state.bond_details = bond_df
 if "cashflow_details" not in st.session_state:
     st.session_state.cashflow_details = cashflow_df
-if "company_insights" not in st.session_state:
-    st.session_state.company_insights = None
-if "vector_store" not in st.session_state:
-    st.session_state.vector_store = None
-if "embeddings_dict" not in st.session_state:
-    st.session_state.embeddings_dict = {}
+if "finder_details" not in st.session_state:
+    st.session_state.finder_details = mock_finder_df
+if "screener_details" not in st.session_state:
+    st.session_state.screener_details = mock_screener_df
 if "data_loading_status" not in st.session_state:
     st.session_state.data_loading_status = {
         "bond": {"status": "success", "message": "Sample bond loaded"},
         "cashflow": {"status": "success", "message": "Sample cashflow loaded"},
-        "company": {"status": "not_started", "message": "Not loaded"},
-        "web": {"status": "not_started", "message": "Not loaded"}
+        "finder": {"status": "success", "message": "Sample finder loaded"},
+        "screener": {"status": "success", "message": "Sample screener loaded"}
     }
-if "last_load_attempt" not in st.session_state:
-    st.session_state.last_load_attempt = 0
-if "search_results" not in st.session_state:
-    st.session_state.search_results = {}
-if "web_cache" not in st.session_state:
-    st.session_state.web_cache = {}
-
-# Vector store for efficient similarity search
-class VectorStore:
-    def __init__(self, dimension=768):
-        self.dimension = dimension
-        self.index = faiss.IndexFlatL2(dimension)
-        self.texts = []
-
-    def add_texts(self, texts: List[str], embeddings: List[List[float]]):
-        if not texts or not embeddings:
-            return
-        embeddings_array = np.array(embeddings).astype('float32')
-        self.index.add(embeddings_array)
-        self.texts.extend(texts)
-
-    def similarity_search(self, query_embedding: List[float], k: int = 5) -> List[str]:
-        query_array = np.array([query_embedding]).astype('float32')
-        D, I = self.index.search(query_array, k)
-        return [self.texts[i] for i in I[0] if i < len(self.texts)]
-
-@st.cache_data(ttl=3600)
-def fetch_web_content(url: str) -> str:
-    try:
-        response = requests.get(url, timeout=10)
-        response.raise_for_status()
-        soup = BeautifulSoup(response.text, 'html.parser')
-        h = html2text.HTML2Text()
-        h.ignore_links = True
-        content = h.handle(soup.get_text())
-        return content[:5000]
-    except Exception as e:
-        logger.error(f"Error fetching web content: {str(e)}")
-        return ""
-
-@st.cache_data(ttl=3600)
-def perform_web_search(query: str, num_results: int = 2) -> List[Dict]:
-    try:
-        search = DuckDuckGoSearchAPIWrapper()
-        results = search.results(query, num_results)
-        enhanced_results = []
-        for result in results:
-            if result["link"] not in st.session_state.web_cache:
-                content = fetch_web_content(result["link"])
-                st.session_state.web_cache[result["link"]] = {
-                    "content": content,
-                    "timestamp": datetime.now()
-                }
-            enhanced_results.append({
-                **result,
-                "content": st.session_state.web_cache[result["link"]]["content"][:2000]
-            })
-        return enhanced_results
-    except Exception as e:
-        logger.error(f"Error in web search: {str(e)}")
-        return []
-
-def save_uploadedfile(uploadedfile):
-    try:
-        if uploadedfile is not None:
-            with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as f:
-                f.write(uploadedfile.getvalue())
-                return f.name
-    except Exception as e:
-        logger.error(f"Error saving file: {str(e)}")
-    return None
-
-def validate_csv_file(file_path: str, expected_columns: List[str]) -> Tuple[bool, str]:
-    try:
-        df_header = pd.read_csv(file_path, nrows=0)
-        missing_columns = [col for col in expected_columns if col not in df_header.columns]
-        if missing_columns:
-            return False, f"Missing columns: {', '.join(missing_columns)}"
-        return True, "File validated successfully"
-    except Exception as e:
-        return False, f"Error validating file: {str(e)}"
-
-def process_json_columns(df: pd.DataFrame, json_columns: List[str]) -> pd.DataFrame:
-    for col in json_columns:
-        if col in df.columns:
-            df[col] = df[col].apply(lambda x: 
-                json.loads(x) if isinstance(x, str) and x.strip() else {})
-    return df
-
-def lookup_bond_by_isin(isin: str) -> Dict:
-    try:
-        if st.session_state.bond_details is None:
-            return {"error": "Bond data not loaded"}
-            
-        bond_df = st.session_state.bond_details
-        isin = isin.strip().upper()
-        
-        matching_bonds = bond_df[bond_df['isin'] == isin]
-        
-        if matching_bonds.empty:
-            matching_bonds = bond_df[bond_df['isin'].str.contains(isin, case=False, na=False)]
-            
-            if matching_bonds.empty:
-                min_match_length = min(5, len(isin))
-                for i in range(min_match_length, len(isin) + 1):
-                    partial_isin = isin[:i]
-                    matching_bonds = bond_df[bond_df['isin'].str.contains(partial_isin, case=False, na=False)]
-                    if not matching_bonds.empty:
-                        break
-        
-        if not matching_bonds.empty:
-            bond_data = matching_bonds.iloc[0].to_dict()
-            
-            cashflow_data = None
-            if st.session_state.cashflow_details is not None:
-                cashflow = st.session_state.cashflow_details[
-                    st.session_state.cashflow_details['isin'] == matching_bonds.iloc[0]['isin']
-                ]
-                if not cashflow.empty:
-                    cashflow_data = cashflow.to_dict('records')
-            
-            company_data = None
-            if st.session_state.company_insights is not None:
-                company = st.session_state.company_insights[
-                    st.session_state.company_insights['company_name'] == matching_bonds.iloc[0]['company_name']
-                ]
-                if not company.empty:
-                    company_data = company.iloc[0].to_dict()
-            
-            return {
-                "bond_data": bond_data,
-                "cashflow_data": cashflow_data,
-                "company_data": company_data,
-                "matches": len(matching_bonds)
-            }
-        
-        return {"error": f"No bond found with ISIN: {isin}"}
-    except Exception as e:
-        logger.error(f"Error looking up bond: {str(e)}\n{traceback.format_exc()}")
-        return {"error": f"Error looking up bond: {str(e)}"}
-
-def load_data(bond_files, cashflow_file, company_file) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Dict]]:
-    status = {
-        "bond": {"status": "not_started", "message": ""},
-        "cashflow": {"status": "not_started", "message": ""},
-        "company": {"status": "not_started", "message": ""}
-    }
-
-    try:
-        bond_dfs = []
-        if bond_files and any(bond_files):
-            status["bond"]["status"] = "in_progress"
-            for i, bf in enumerate(bond_files):
-                if bf is None:
-                    continue
-                bond_path = save_uploadedfile(bf)
-                if bond_path:
-                    try:
-                        is_valid, validation_message = validate_csv_file(
-                            bond_path, ['isin', 'company_name']
-                        )
-                        if not is_valid:
-                            status["bond"]["status"] = "error"
-                            status["bond"]["message"] = f"Bond file {i+1}: {validation_message}"
-                            continue
-                        df = pd.read_csv(bond_path)
-                        if not df.empty:
-                            if 'isin' in df.columns:
-                                df['isin'] = df['isin'].astype(str)
-                            if 'coupon_rate' in df.columns:
-                                df['coupon_rate'] = df['coupon_rate'].astype(str).str.replace('%', '').astype(float)
-                            json_columns = ['coupon_details', 'issuer_details', 'instrument_details']
-                            df = process_json_columns(df, json_columns)
-                            bond_dfs.append(df)
-                    finally:
-                        try:
-                            os.unlink(bond_path)
-                        except Exception:
-                            pass
-
-        bond_details = pd.concat(bond_dfs, ignore_index=True) if bond_dfs else None
-        if bond_details is not None:
-            status["bond"]["status"] = "success"
-            status["bond"]["message"] = f"Loaded {len(bond_details)} bonds"
-
-        cashflow_details = None
-        if cashflow_file:
-            status["cashflow"]["status"] = "in_progress"
-            cashflow_path = save_uploadedfile(cashflow_file)
-            if cashflow_path:
-                try:
-                    is_valid, validation_message = validate_csv_file(
-                        cashflow_path, ['isin', 'cash_flow_date']
-                    )
-                    if is_valid:
-                        cashflow_details = pd.read_csv(cashflow_path)
-                        if not cashflow_details.empty:
-                            if 'isin' in cashflow_details.columns:
-                                cashflow_details['isin'] = cashflow_details['isin'].astype(str)
-                            status["cashflow"]["status"] = "success"
-                            status["cashflow"]["message"] = f"Loaded {len(cashflow_details)} records"
-                    else:
-                        status["cashflow"]["status"] = "error"
-                        status["cashflow"]["message"] = validation_message
-                finally:
-                    try:
-                        os.unlink(cashflow_path)
-                    except Exception:
-                        pass
-
-        company_insights = None
-        if company_file:
-            status["company"]["status"] = "in_progress"
-            company_path = save_uploadedfile(company_file)
-            if company_path:
-                try:
-                    is_valid, validation_message = validate_csv_file(
-                        company_path, ['company_name']
-                    )
-                    if is_valid:
-                        company_insights = pd.read_csv(company_path)
-                        json_columns = ['key_metrics', 'income_statement', 'balance_sheet', 'cashflow']
-                        company_insights = process_json_columns(company_insights, json_columns)
-                        if not company_insights.empty:
-                            status["company"]["status"] = "success"
-                            status["company"]["message"] = f"Loaded {len(company_insights)} companies"
-                    else:
-                        status["company"]["status"] = "error"
-                        status["company"]["message"] = validation_message
-                finally:
-                    try:
-                        os.unlink(company_path)
-                    except Exception:
-                        pass
-
-        return bond_details, cashflow_details, company_insights, status
-
-    except Exception as e:
-        logger.error(f"Error loading data: {str(e)}")
-        for key in status:
-            if status[key]["status"] in ["not_started", "in_progress"]:
-                status[key]["status"] = "error"
-                status[key]["message"] = "Unexpected error during processing"
-        return None, None, None, status
 
 @st.cache_resource
 def get_llm(api_key: str, model: str = "llama3-70b-8192"):
@@ -366,321 +144,337 @@ def get_llm(api_key: str, model: str = "llama3-70b-8192"):
         logger.error(f"Error initializing LLM: {str(e)}")
         return None
 
-def extract_bond_summary(data: Dict) -> str:
-    if not data or "bond_data" not in data:
-        return "No specific bond data found"
-    
-    bond = data["bond_data"]
-    summary = {
-        "isin": bond.get("isin", "N/A"),
-        "company_name": bond.get("company_name", "N/A"),
-        "face_value": bond.get("face_value", "N/A"),
-        "ytm": bond.get("ytm", "N/A"),
-        "coupon_rate": bond.get("coupon_rate", "N/A"),
-        "npv": bond.get("npv", "N/A"),
-        "trade_date": bond.get("trade_date", "N/A")
+def save_uploadedfile(uploadedfile):
+    try:
+        if uploadedfile is not None:
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.csv') as f:
+                f.write(uploadedfile.getvalue())
+                return f.name
+    except Exception as e:
+        logger.error(f"Error saving file: {str(e)}")
+    return None
+
+def load_data(bond_files, cashflow_file, finder_file, screener_file):
+    status = {
+        "bond": {"status": "not_started", "message": ""},
+        "cashflow": {"status": "not_started", "message": ""},
+        "finder": {"status": "not_started", "message": ""},
+        "screener": {"status": "not_started", "message": ""}
     }
-    return json.dumps(summary, indent=2)
-
-def extract_cashflow_summary(data: List) -> str:
-    if not data:
-        return "No specific cashflow data found"
-    
-    limited_data = data[:5]
-    summarized = []
-    
-    for cf in limited_data:
-        summary = {
-            "isin": cf.get("isin", "N/A"),
-            "cash_flow_date": cf.get("cash_flow_date", "N/A"),
-            "principal_amount": cf.get("principal_amount", "N/A"),
-            "interest_amount": cf.get("interest_amount", "N/A"),
-            "record_date": cf.get("record_date", "N/A")
-        }
-        summarized.append(summary)
-    
-    return json.dumps(summarized, indent=2)
-
-def filter_bonds_by_coupon(bond_df: pd.DataFrame, min_coupon: float) -> List[Dict]:
-    """Filter bonds with coupon rate above a specified threshold"""
     try:
-        if 'coupon_rate' not in bond_df.columns:
-            return []
-        
-        # Convert coupon_rate to float, handling strings with % if necessary
-        bond_df['coupon_rate'] = pd.to_numeric(
-            bond_df['coupon_rate'].astype(str).str.replace('%', ''),
-            errors='coerce'
-        )
-        
-        filtered_bonds = bond_df[bond_df['coupon_rate'] > min_coupon]
-        return filtered_bonds.to_dict('records')
+        bond_dfs = []
+        if bond_files and any(bond_files):
+            status["bond"]["status"] = "in_progress"
+            for bf in bond_files:
+                if bf is None:
+                    continue
+                bond_path = save_uploadedfile(bf)
+                if bond_path:
+                    df = pd.read_csv(bond_path)
+                    if 'isin' in df.columns:
+                        df['isin'] = df['isin'].astype(str)
+                    if 'coupon_rate' in df.columns:
+                        df['coupon_rate'] = pd.to_numeric(df['coupon_rate'].astype(str).str.replace('%', ''), errors='coerce')
+                    bond_dfs.append(df)
+                    os.unlink(bond_path)
+        bond_details = pd.concat(bond_dfs, ignore_index=True) if bond_dfs else None
+        if bond_details is not None:
+            status["bond"]["status"] = "success"
+            status["bond"]["message"] = f"Loaded {len(bond_details)} bonds"
+
+        cashflow_details = None
+        if cashflow_file:
+            cashflow_path = save_uploadedfile(cashflow_file)
+            if cashflow_path:
+                cashflow_details = pd.read_csv(cashflow_path)
+                if 'isin' in cashflow_details.columns:
+                    cashflow_details['isin'] = cashflow_details['isin'].astype(str)
+                status["cashflow"]["status"] = "success"
+                status["cashflow"]["message"] = f"Loaded {len(cashflow_details)} records"
+                os.unlink(cashflow_path)
+
+        finder_details = None
+        if finder_file:
+            finder_path = save_uploadedfile(finder_file)
+            if finder_path:
+                finder_details = pd.read_csv(finder_path)
+                status["finder"]["status"] = "success"
+                status["finder"]["message"] = f"Loaded {len(finder_details)} finder records"
+                os.unlink(finder_path)
+
+        screener_details = None
+        if screener_file:
+            screener_path = save_uploadedfile(screener_file)
+            if screener_path:
+                screener_details = pd.read_csv(screener_path)
+                status["screener"]["status"] = "success"
+                status["screener"]["message"] = f"Loaded {len(screener_details)} screener records"
+                os.unlink(screener_path)
+
+        return bond_details, cashflow_details, finder_details, screener_details, status
     except Exception as e:
-        logger.error(f"Error filtering bonds: {str(e)}")
-        return []
+        logger.error(f"Error loading data: {str(e)}")
+        return None, None, None, None, status
 
-def process_query(query: str, context: Dict, llm) -> Dict:
-    try:
-        if not llm:
-            return {"error": "AI model not initialized. Please check API key."}
+# Simulated website retriever
+def retrieve_website_content(query: str) -> str:
+    # Mock retrieval from TapBonds.com
+    mock_content = """
+    Tap Bonds is a knowledge and research platform for bonds.
+    Bond Directory: https://tapbonds.com/directory - 22k ISINs available.
+    Bond Finder: https://tapbonds.com/finder - Compare bonds on SMEST and FixedIncome.
+    Bond Screener: Analyze company financials at https://tapbonds.com/tools/screener.
+    """
+    return mock_content
 
-        bond_df = context.get("bond_data")
-        response_text = ""
+# Bond Yield Calculator Logic
+def calculate_bond_price(cashflows: List[Dict], yield_rate: float, investment_date: str) -> float:
+    total_pv = 0
+    inv_date = datetime.strptime(investment_date, "%d-%m-%Y")
+    for cf in cashflows:
+        cf_date = datetime.strptime(cf["cash_flow_date"], "%d-%m-%Y")
+        if cf_date < inv_date:
+            continue
+        days_diff = (cf_date - inv_date).days
+        years = days_diff / 365.0
+        pv = (cf["principal_amount"] + cf["interest_amount"]) / ((1 + yield_rate / 100) ** years)
+        total_pv += pv
+    return round(total_pv, 2)
+
+def calculate_bond_yield(cashflows: List[Dict], price: float, investment_date: str) -> float:
+    def npv(yield_rate):
+        return calculate_bond_price(cashflows, yield_rate, investment_date) - price
+    
+    # Simple binary search for yield
+    low, high = 0.0, 50.0
+    for _ in range(100):
+        mid = (low + high) / 2
+        if npv(mid) > 0:
+            low = mid
+        else:
+            high = mid
+        if abs(high - low) < 0.001:
+            break
+    return round(mid, 2)
+
+# Agent Classes
+class OrchestratorAgent:
+    def __init__(self, llm, bond_agent, finder_agent, cashflow_agent, screener_agent):
+        self.llm = llm
+        self.bond_agent = bond_agent
+        self.finder_agent = finder_agent
+        self.cashflow_agent = cashflow_agent
+        self.screener_agent = screener_agent
+
+    def process_query(self, query: str) -> str:
+        query_lower = query.lower()
+        if "isin" in query_lower or "details for" in query_lower or "issuances" in query_lower:
+            return self.bond_agent.handle_query(query)
+        elif "available" in query_lower or "yield" in query_lower or "platform" in query_lower:
+            return self.finder_agent.handle_query(query)
+        elif "cash flow" in query_lower or "maturity" in query_lower or "price" in query_lower or "yield" in query_lower:
+            return self.cashflow_agent.handle_query(query)
+        elif "company" in query_lower or "ratio" in query_lower or "financial" in query_lower:
+            return self.screener_agent.handle_query(query)
+        else:
+            return "Please specify a valid query related to bonds, finder, cash flow, or screener."
+
+class BondsDirectoryAgent:
+    def __init__(self, bond_df):
+        self.bond_df = bond_df
+
+    def handle_query(self, query: str) -> str:
+        query_lower = query.lower()
         
-        # Handle specific filtering query like "Find bonds with coupon rate above 8%"
-        if "coupon rate above" in query.lower():
-            try:
-                min_coupon = float(query.lower().split("coupon rate above")[1].split("%")[0].strip())
-                filtered_bonds = filter_bonds_by_coupon(bond_df, min_coupon)
-                
-                if filtered_bonds:
-                    response_text = f"### Bonds with Coupon Rate Above {min_coupon}%\n\n"
-                    response_text += f"Found {len(filtered_bonds)} bonds matching your criteria:\n\n"
-                    for bond in filtered_bonds[:10]:  # Limit to top 10 for brevity
-                        response_text += f"- **ISIN:** {bond.get('isin', 'N/A')}  \n"
-                        response_text += f"  **Company:** {bond.get('company_name', 'N/A')}  \n"
-                        response_text += f"  **Coupon Rate:** {bond.get('coupon_rate', 'N/A')}%  \n"
-                        response_text += f"  **Face Value:** {bond.get('face_value', 'N/A')}  \n\n"
-                    if len(filtered_bonds) > 10:
-                        response_text += f"*Showing top 10 of {len(filtered_bonds)} matches.*\n"
-                else:
-                    response_text = f"### Bonds with Coupon Rate Above {min_coupon}%\n\nNo bonds found with a coupon rate above {min_coupon}% in the loaded data."
-                return {"response": response_text, "web_results": []}
-            except ValueError:
-                pass  # Fall back to LLM if parsing fails
+        # Basic ISIN Lookup
+        if "details for isin" in query_lower:
+            isin = query.split()[-1].upper()
+            bond = self.bond_df[self.bond_df['isin'] == isin]
+            if not bond.empty:
+                b = bond.iloc[0]
+                return f"""
+                ### Bond Details for {isin}
+                - **Issuer Name:** {b['company_name']}
+                - **Type of Issuer:** Non-PSU
+                - **Sector:** Financial Services
+                - **Coupon Rate:** {b['coupon_rate']}
+                - **Instrument Name:** {b['coupon_rate']} Secured NCDs
+                - **Face Value:** ₹{b['face_value']:,}
+                - **Redemption Date:** {b['maturity_date']}
+                - **Credit Rating:** {b['credit_rating']}
+                """
+            return f"No bond found with ISIN: {isin}"
 
-        # Handle ISIN-specific queries
-        isin_query = query.strip().upper()
-        specific_bond_data = None
-        if (len(isin_query) >= 5 and "bond_data" in context) or "ISIN" in isin_query:
-            if "ISIN" in isin_query:
-                import re
-                isin_pattern = re.search(r'[A-Z0-9]{5,}', isin_query)
-                if isin_pattern:
-                    isin_query = isin_pattern.group(0)
-            specific_bond_data = lookup_bond_by_isin(isin_query)
+        # Issuances by Company
+        elif "issuances done by" in query_lower:
+            company = " ".join(query.split()[4:]).title()
+            bonds = self.bond_df[self.bond_df['company_name'].str.contains(company, case=False)]
+            if not bonds.empty:
+                active = bonds[bonds['maturity_date'] > "09-03-2025"]
+                matured = len(bonds) - len(active)
+                response = f"""
+                ### Issuances by {company}
+                {company} has issued {len(bonds)} bonds in total.
+                - {matured} have matured
+                - {len(active)} are active
+                #### Active Bonds:
+                | ISIN | Coupon Rate | Maturity Date | Face Value | Credit Rating |
+                |------|-------------|---------------|------------|--------------|
+                """
+                for _, b in active.iterrows():
+                    response += f"| {b['isin']} | {b['coupon_rate']} | {b['maturity_date']} | ₹{b['face_value']:,} | {b['credit_rating']} |\n"
+                return response
+            return f"No issuances found for {company}"
 
-        web_results = perform_web_search(query, num_results=1)
-        web_snippets = []
-        for result in web_results:
-            web_snippets.append({
-                "title": result.get("title", ""),
-                "snippet": result.get("snippet", "")
-            })
+        # Filter-Based Search
+        elif "coupon rate above" in query_lower:
+            min_coupon = float(query_lower.split("coupon rate above")[1].split("%")[0].strip())
+            filtered = self.bond_df[self.bond_df['coupon_rate'].str.replace('%', '').astype(float) > min_coupon]
+            if not filtered.empty:
+                response = f"### Bonds with Coupon Rate Above {min_coupon}%\nFound {len(filtered)} bonds:\n"
+                for _, b in filtered.head(3).iterrows():
+                    response += f"- **ISIN:** {b['isin']}  \n  **Issuer:** {b['company_name']}  \n  **Coupon Rate:** {b['coupon_rate']}  \n  **Maturity:** {b['maturity_date']}\n"
+                return response
+            return f"No bonds found with coupon rate above {min_coupon}%"
+
+class BondFinderAgent:
+    def __init__(self, finder_df):
+        self.finder_df = finder_df
+
+    def handle_query(self, query: str) -> str:
+        query_lower = query.lower()
         
-        template = """You are a financial expert specializing in bond analysis.
-
-        User Query: {query}
-
-        {specific_bond_info}
-
-        {web_info}
-
-        Please provide a concise analysis based on the available information.
-        Format your response using Markdown for better readability.
-        If the user is looking for a specific bond by ISIN, focus on providing key details.
-        """
-
-        specific_bond_info = ""
-        if specific_bond_data and "error" not in specific_bond_data:
-            specific_bond_info = f"""
-            Specific Bond Information:
-            {extract_bond_summary(specific_bond_data)}
-            
-            Cashflow Information:
-            {extract_cashflow_summary(specific_bond_data.get('cashflow_data', []))}
+        # General Inquiry
+        if "bonds are available in the bond finder" in query_lower:
+            response = """
+            ### Available Bonds in Bond Finder
+            Currently showcasing bonds on SMEST and FixedIncome:
+            | Issuer | Rating | Yield Range | Available At |
+            |--------|--------|-------------|--------------|
             """
+            for _, f in self.finder_df.iterrows():
+                response += f"| {f['company_name']} | {f['credit_rating']} | {f['yield_range']} | {f['platform']} |\n"
+            return response
+
+        # Platform Availability
+        elif "where can i buy bonds from" in query_lower:
+            issuer = " ".join(query.split()[5:]).title()
+            bonds = self.finder_df[self.finder_df['company_name'].str.contains(issuer, case=False)]
+            if not bonds.empty:
+                b = bonds.iloc[0]
+                return f"### Bonds from {issuer}\nAvailable on {b['platform']} with yield range {b['yield_range']}."
+            return f"Bonds from {issuer} are currently not available."
+
+        # Yield-Based Search
+        elif "yield of more than" in query_lower:
+            min_yield = float(query_lower.split("yield of more than")[1].split("%")[0].strip())
+            filtered = self.finder_df[self.finder_df['yield_range'].apply(lambda x: float(x.split('-')[0].replace('%', '')) > min_yield)]
+            if not filtered.empty:
+                response = f"### Bonds with Yield > {min_yield}%\n"
+                for _, f in filtered.iterrows():
+                    response += f"- **Issuer:** {f['company_name']}  \n  **Rating:** {f['credit_rating']}  \n  **Yield:** {f['yield_range']}  \n  **Available At:** {f['platform']}\n"
+                return response
+            return f"No bonds found with yield above {min_yield}%"
+
+class CashFlowMaturityAgent:
+    def __init__(self, cashflow_df, bond_df):
+        self.cashflow_df = cashflow_df
+        self.bond_df = bond_df
+
+    def handle_query(self, query: str) -> str:
+        query_lower = query.lower()
         
-        web_info = ""
-        if web_snippets:
-            web_info = "Relevant Web Information:\n"
-            for i, result in enumerate(web_snippets):
-                web_info += f"Source {i+1}: {result['title']}\n{result['snippet']}\n\n"
+        # Cash Flow Schedule
+        if "cash flow schedule for isin" in query_lower:
+            isin = query.split()[-1].upper()
+            cashflows = self.cashflow_df[self.cashflow_df['isin'] == isin]
+            if not cashflows.empty:
+                response = f"### Cash Flow Schedule for {isin}\n| Date | Type |\n|------|------|\n"
+                for _, cf in cashflows.iterrows():
+                    cf_type = "Principal + Interest" if cf['principal_amount'] > 0 else "Interest Payment"
+                    response += f"| {cf['cash_flow_date']} | {cf_type} |\n"
+                return response
+            return f"No cash flow data found for ISIN: {isin}"
 
-        prompt = ChatPromptTemplate.from_template(template)
-        chain = prompt | llm | StrOutputParser()
+        # Yield/Price Calculation
+        elif "price" in query_lower or "yield" in query_lower:
+            if "what will be the consideration" in query_lower:
+                return "Please use the calculator tool or provide ISIN, units, date, and yield/price to calculate."
+            # Placeholder for UI-driven calculator
+            return "Yield/Price calculator requires UI input. Please specify ISIN, investment date, units, and yield/price."
 
-        response = chain.invoke({
-            "query": query,
-            "specific_bond_info": specific_bond_info,
-            "web_info": web_info
-        })
+class BondScreenerAgent:
+    def __init__(self, screener_df):
+        self.screener_df = screener_df
 
-        return {
-            "response": response,
-            "web_results": web_results
-        }
+    def handle_query(self, query: str) -> str:
+        query_lower = query.lower()
+        
+        # Company Rating
+        if "rating of" in query_lower:
+            company = " ".join(query.split()[4:]).title()
+            comp = self.screener_df[self.screener_df['company_name'].str.contains(company, case=False)]
+            if not comp.empty:
+                return f"### Rating of {company}\nCredit Rating: {comp.iloc[0]['credit_rating']}"
+            return f"No data found for {company}"
 
-    except Exception as e:
-        logger.error(f"Error processing query: {str(e)}")
-        return {"error": f"Error processing query: {str(e)}"}
+        # Sector Inquiry
+        elif "is in which sector" in query_lower:
+            company = " ".join(query.split()[1:-3]).title()
+            comp = self.screener_df[self.screener_df['company_name'].str.contains(company, case=False)]
+            if not comp.empty:
+                return f"### Sector of {company}\nSector: {comp.iloc[0]['sector']}"
+            return f"No data found for {company}"
 
-def display_status():
+def main():
+    st.title("Tap Bonds AI Hackathon")
+    st.markdown("""
+    Welcome to the Tap Bonds Hackathon! Build an AI-powered layer for bond discovery and research.
+    """)
+
+    with st.sidebar:
+        api_key = os.getenv("GROQ_API_KEY") or st.text_input("Enter GROQ API Key", type="password")
+        model_option = st.selectbox("Select Model", ["llama3-70b-8192", "llama3-8b-8192"])
+        bond_files = [st.file_uploader(f"Bond Details {i+1}", type=["csv"], key=f"bond_{i}") for i in range(2)]
+        cashflow_file = st.file_uploader("Cashflow Details", type=["csv"], key="cashflow")
+        finder_file = st.file_uploader("Finder Details", type=["csv"], key="finder")
+        screener_file = st.file_uploader("Screener Details", type=["csv"], key="screener")
+        
+        if st.button("Load Data"):
+            with st.spinner("Loading data..."):
+                bond_details, cashflow_details, finder_details, screener_details, status = load_data(
+                    bond_files, cashflow_file, finder_file, screener_file
+                )
+                st.session_state.bond_details = bond_details if bond_details is not None else bond_df
+                st.session_state.cashflow_details = cashflow_details if cashflow_details is not None else cashflow_df
+                st.session_state.finder_details = finder_details if finder_details is not None else mock_finder_df
+                st.session_state.screener_details = screener_details if screener_details is not None else mock_screener_df
+                st.session_state.data_loading_status.update(status)
+                st.success("Data loaded!")
+
+    # Initialize agents
+    llm = get_llm(api_key, model_option)
+    bond_agent = BondsDirectoryAgent(st.session_state.bond_details)
+    finder_agent = BondFinderAgent(st.session_state.finder_details)
+    cashflow_agent = CashFlowMaturityAgent(st.session_state.cashflow_details, st.session_state.bond_details)
+    screener_agent = BondScreenerAgent(st.session_state.screener_details)
+    orchestrator = OrchestratorAgent(llm, bond_agent, finder_agent, cashflow_agent, screener_agent)
+
+    # Basic UI
+    query = st.text_input("Enter your query", placeholder="e.g., Show me details for ISIN INE08XP07258")
+    if query:
+        with st.spinner("Processing..."):
+            response = orchestrator.process_query(query)
+            st.markdown("### Response")
+            st.markdown(response)
+
+    # Display status
+    st.markdown("### Data Status")
     cols = st.columns(len(st.session_state.data_loading_status))
     for col, (key, value) in zip(cols, st.session_state.data_loading_status.items()):
         with col:
             status_icon = "✅" if value["status"] == "success" else "❌"
             st.markdown(f"{status_icon} **{key.title()}:** {value['message']}")
-
-def main():
-    try:
-        with st.sidebar:
-            st.title("Configuration")
-            api_key = os.getenv("GROQ_API_KEY") or st.text_input("Enter your GROQ API Key", type="password")
-            model_option = st.selectbox(
-                "Select Model",
-                ["llama3-70b-8192", "llama3-8b-8192", "mixtral-8x7b-32768"],
-                help="Choose the AI model for analysis"
-            )
-            st.markdown("### Data Management")
-            if st.button("Clear All Data", type="secondary"):
-                for key in ["bond_details", "cashflow_details", "company_insights", 
-                          "vector_store", "embeddings_dict", "web_cache"]:
-                    if key in st.session_state:
-                        st.session_state[key] = None
-                st.session_state.data_loading_status = {
-                    k: {"status": "not_started", "message": "Not loaded"}
-                    for k in st.session_state.data_loading_status
-                }
-                st.success("All data cleared!")
-                st.rerun()
-
-            st.markdown("#### Upload Files")
-            bond_files = [
-                st.file_uploader(f"Bond Details Part {i+1}", type=["csv"], key=f"bond_{i}")
-                for i in range(2)
-            ]
-            cashflow_file = st.file_uploader("Cashflow Details", type=["csv"], key="cashflow")
-            company_file = st.file_uploader("Company Insights", type=["csv"], key="company")
-
-            if st.button("Load Data", type="primary"):
-                with st.spinner("Processing data files..."):
-                    bond_details, cashflow_details, company_insights, status = load_data(
-                        bond_files, cashflow_file, company_file
-                    )
-                    st.session_state.bond_details = bond_details if bond_details is not None else bond_df
-                    st.session_state.cashflow_details = cashflow_details if cashflow_details is not None else cashflow_df
-                    st.session_state.company_insights = company_insights
-                    st.session_state.data_loading_status.update(status)
-                    if any(s["status"] == "success" for s in status.values()):
-                        st.success("Data loaded successfully!")
-                        st.rerun()
-                    else:
-                        st.error("Failed to load data. Check status below.")
-
-        st.title("Tap Bonds AI Platform")
-        st.markdown("""
-        Welcome to the Tap Bonds AI Platform! 💼
-        This platform provides AI-powered bond analysis and insights using GROQ's advanced language models.
-        Upload your data files and ask questions about bonds, companies, or market trends.
-        Sample bond data (INE08XP07258) is pre-loaded for demonstration.
-        """)
-
-        st.markdown("### Data Status")
-        display_status()
-
-        if st.session_state.bond_details is not None:
-            with st.expander("Debug Information (Data Overview)"):
-                st.write("Bond Data Sample (first 3 rows):")
-                st.dataframe(st.session_state.bond_details.head(3))
-                if st.session_state.cashflow_details is not None:
-                    st.write("Cashflow Data Sample (first 3 rows):")
-                    st.dataframe(st.session_state.cashflow_details.head(3))
-
-        if any(value["status"] == "success" for value in st.session_state.data_loading_status.values()):
-            tabs = st.tabs(["Bond Data Explorer", "AI Query"])
-            
-            with tabs[0]:
-                st.subheader("Look up bond by ISIN")
-                isin_input = st.text_input("Enter ISIN", key="isin_lookup", 
-                                         placeholder="e.g., INE08XP07258",
-                                         help="Enter full or partial ISIN code")
-                
-                if isin_input:
-                    with st.spinner("Looking up bond details..."):
-                        bond_result = lookup_bond_by_isin(isin_input)
-                        
-                        if "error" in bond_result:
-                            st.error(bond_result["error"])
-                        else:
-                            if bond_result.get("matches", 1) > 1:
-                                st.info(f"Found {bond_result.get('matches')} bonds matching '{isin_input}'. Showing the first match.")
-                            
-                            bond_data = bond_result.get("bond_data", {})
-                            cashflow_data = bond_result.get("cashflow_data", [])
-                            
-                            st.markdown("### Bond Details")
-                            st.markdown(f"**ISIN:** {bond_data.get('isin', 'N/A')}")
-                            st.markdown(f"**Company:** {bond_data.get('company_name', 'N/A')}")
-                            st.markdown(f"**Face Value:** {bond_data.get('face_value', 'N/A')}")
-                            st.markdown(f"**YTM:** {bond_data.get('ytm', 'N/A')}")
-                            st.markdown(f"**Coupon Rate:** {bond_data.get('coupon_rate', 'N/A')}")
-                            st.json(bond_data)
-                            
-                            if cashflow_data:
-                                st.markdown("### Cashflow Details")
-                                st.dataframe(pd.DataFrame(cashflow_data))
-            
-            with tabs[1]:
-                query = st.text_input(
-                    "Ask about bonds, companies, or market trends",
-                    placeholder="e.g., Find bonds with coupon rate above 8%",
-                    label_visibility="collapsed"
-                )
-                
-                if query:
-                    llm = get_llm(api_key, model_option)
-                    if not llm:
-                        st.error("Please provide a valid GROQ API key to continue.")
-                        return
-
-                    with st.spinner("Processing your query..."):
-                        context = {
-                            "bond_data": st.session_state.bond_details,
-                            "cashflow_data": st.session_state.cashflow_details,
-                            "company_data": st.session_state.company_insights
-                        }
-                        result = process_query(query, context, llm)
-
-                        if "error" in result:
-                            st.error(result["error"])
-                        else:
-                            st.markdown("### Analysis")
-                            st.markdown(result["response"])
-                            if result.get("web_results"):
-                                with st.expander("Web Search Results"):
-                                    for i, r in enumerate(result["web_results"], 1):
-                                        st.markdown(f"**{i}. [{r['title']}]({r['link']})**")
-                                        st.markdown(r['snippet'])
-                            st.session_state.chat_history.append({
-                                "query": query,
-                                "response": result["response"]
-                            })
-
-            if st.session_state.chat_history:
-                with st.expander("Chat History"):
-                    for chat in st.session_state.chat_history:
-                        st.markdown(f"**Q:** {chat['query']}")
-                        st.markdown(f"**A:** {chat['response']}")
-                        st.markdown("---")
-        else:
-            st.info("Please upload and process data files to begin analysis.")
-
-        with st.expander("Example Queries"):
-            st.markdown("""
-            ### Bond Analysis
-            - Show details for ISIN INE08XP07258
-            - Find bonds with coupon rate above 8%
-            - Find bonds with yield above 15%
-
-            ### Cash Flow Analysis
-            - Show cashflows for ISIN INE08XP07258 in 2025
-            - When is the principal repayment for INE08XP07258?
-            """)
-
-    except Exception as e:
-        st.error(f"An unexpected error occurred: {str(e)}")
-        logger.error(f"Error in main: {traceback.format_exc()}")
 
 if __name__ == "__main__":
     main()
