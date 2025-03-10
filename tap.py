@@ -80,7 +80,7 @@ class VectorStore:
 def fetch_web_content(url: str) -> str:
     """Fetch and parse web content with caching"""
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url, timeout=10, verify=True)  # Added verify=True to handle SSL certificates
         response.raise_for_status()
         soup = BeautifulSoup(response.text, 'html.parser')
         h = html2text.HTML2Text()
@@ -250,6 +250,91 @@ def load_data(bond_files, cashflow_file, company_file) -> Tuple[Optional[pd.Data
                 status[key]["message"] = "Unexpected error during processing"
         return None, None, None, status
 
+def lookup_bond_by_isin(isin: str) -> Dict:
+    """Look up bond details by ISIN"""
+    try:
+        # Validate input
+        if not isin or len(isin) < 2:
+            return {"error": "Please enter a valid ISIN"}
+
+        # Check if bond data is loaded
+        if st.session_state.bond_details is None:
+            return {"error": "Bond data not loaded"}
+
+        # Convert to uppercase for case-insensitive matching
+        isin = isin.strip().upper()
+        
+        # Try exact match first
+        exact_match = st.session_state.bond_details[st.session_state.bond_details['isin'] == isin]
+        
+        if not exact_match.empty:
+            bond_data = exact_match.iloc[0].to_dict()
+            
+            # Get corresponding cashflow data if available
+            cashflow_data = []
+            if st.session_state.cashflow_details is not None:
+                cashflow_matches = st.session_state.cashflow_details[
+                    st.session_state.cashflow_details['isin'] == isin
+                ]
+                if not cashflow_matches.empty:
+                    cashflow_data = cashflow_matches.to_dict('records')
+            
+            # Get company data if available
+            company_data = {}
+            if st.session_state.company_insights is not None and 'company_name' in bond_data:
+                company_matches = st.session_state.company_insights[
+                    st.session_state.company_insights['company_name'] == bond_data['company_name']
+                ]
+                if not company_matches.empty:
+                    company_data = company_matches.iloc[0].to_dict()
+            
+            return {
+                "bond_data": bond_data,
+                "cashflow_data": cashflow_data,
+                "company_data": company_data
+            }
+        
+        # Try partial match if exact match fails
+        partial_matches = st.session_state.bond_details[
+            st.session_state.bond_details['isin'].str.contains(isin, case=False, na=False)
+        ]
+        
+        if not partial_matches.empty:
+            # If there are multiple matches, return the first one
+            bond_data = partial_matches.iloc[0].to_dict()
+            matched_isin = bond_data['isin']
+            
+            # Get corresponding cashflow data if available
+            cashflow_data = []
+            if st.session_state.cashflow_details is not None:
+                cashflow_matches = st.session_state.cashflow_details[
+                    st.session_state.cashflow_details['isin'] == matched_isin
+                ]
+                if not cashflow_matches.empty:
+                    cashflow_data = cashflow_matches.to_dict('records')
+            
+            # Get company data if available
+            company_data = {}
+            if st.session_state.company_insights is not None and 'company_name' in bond_data:
+                company_matches = st.session_state.company_insights[
+                    st.session_state.company_insights['company_name'] == bond_data['company_name']
+                ]
+                if not company_matches.empty:
+                    company_data = company_matches.iloc[0].to_dict()
+            
+            return {
+                "bond_data": bond_data,
+                "cashflow_data": cashflow_data,
+                "company_data": company_data,
+                "is_partial_match": True
+            }
+        
+        return {"error": f"No bond found with ISIN {isin}"}
+    
+    except Exception as e:
+        logger.error(f"Error looking up bond: {str(e)}")
+        return {"error": f"Error looking up bond: {str(e)}"}
+
 @st.cache_resource
 def get_llm(api_key: str, model: str = "llama3-70b-8192"):
     """Initialize LLM with caching"""
@@ -300,15 +385,15 @@ def process_query(query: str, context: Dict, llm) -> Dict:
         web_results = perform_web_search(query)
         web_context = "\n".join(result.get("content", "") for result in web_results)
 
-        # Create enhanced prompt
+        # Create enhanced prompt - with token reduction strategy
         template = """You are a financial expert specializing in bond analysis.
 
         User Query: {query}
 
-        Available Data:
-        Bond Data: {bond_data}
-        Cashflow Data: {cashflow_data}
-        Company Data: {company_data}
+        Available Data Summary:
+        Bond Data: {bond_data_summary}
+        Cashflow Data: {cashflow_data_summary}
+        Company Data: {company_data_summary}
 
         Specific Bond Data: {specific_bond_data}
         Specific Cashflow Data: {specific_cashflow_data}
@@ -324,13 +409,40 @@ def process_query(query: str, context: Dict, llm) -> Dict:
         prompt = ChatPromptTemplate.from_template(template)
         chain = prompt | llm | StrOutputParser()
 
+        # Create summaries instead of sending full dataframes to reduce token count
+        bond_data_summary = "No bond data available"
+        cashflow_data_summary = "No cashflow data available"
+        company_data_summary = "No company data available"
+        
+        if bond_df is not None:
+            bond_data_summary = f"Dataset with {len(bond_df)} bonds. Sample columns: {', '.join(bond_df.columns[:5])}"
+        
+        if cashflow_df is not None:
+            cashflow_data_summary = f"Dataset with {len(cashflow_df)} cashflow records. Sample columns: {', '.join(cashflow_df.columns[:5])}"
+        
+        if context.get("company_data") is not None:
+            company_data_summary = f"Dataset with {len(context.get('company_data'))} companies. Sample columns: {', '.join(context.get('company_data').columns[:5])}"
+
+        # Truncate web context if too large
+        if web_context and len(web_context) > 2000:
+            web_context = web_context[:2000] + "... [truncated due to length]"
+
+        # Truncate specific data if too large
+        specific_bond_str = str(specific_bond_data)
+        if len(specific_bond_str) > 1000:
+            specific_bond_str = specific_bond_str[:1000] + "... [truncated due to length]"
+            
+        specific_cashflow_str = str(specific_cashflow_data)
+        if len(specific_cashflow_str) > 1000:
+            specific_cashflow_str = specific_cashflow_str[:1000] + "... [truncated due to length]"
+
         response = chain.invoke({
             "query": query,
-            "bond_data": str(context.get("bond_data").head(5)) if bond_df is not None else "No bond data available",
-            "cashflow_data": str(context.get("cashflow_data").head(5)) if cashflow_df is not None else "No cashflow data available",
-            "company_data": str(context.get("company_data").head(5)) if context.get("company_data") is not None else "No company data available",
-            "specific_bond_data": str(specific_bond_data) if specific_bond_data else "No specific bond data found",
-            "specific_cashflow_data": str(specific_cashflow_data) if specific_cashflow_data else "No specific cashflow data found",
+            "bond_data_summary": bond_data_summary,
+            "cashflow_data_summary": cashflow_data_summary,
+            "company_data_summary": company_data_summary,
+            "specific_bond_data": specific_bond_str if specific_bond_data else "No specific bond data found",
+            "specific_cashflow_data": specific_cashflow_str if specific_cashflow_data else "No specific cashflow data found",
             "web_context": web_context
         })
 
@@ -348,8 +460,53 @@ def display_status():
     cols = st.columns(len(st.session_state.data_loading_status))
     for col, (key, value) in zip(cols, st.session_state.data_loading_status.items()):
         with col:
-            status_icon = "✅" if value["status"] == "success" else "❌"
+            status_icon = "✅" if value["status"] == "success" else "❌" if value["status"] == "error" else "⏳"
             st.markdown(f"{status_icon} **{key.title()}:** {value['message']}")
+
+# Cashflow Display Agent class
+class CashflowDisplayAgent:
+    def display_cashflow_summary(self, cashflow_df, bond_data):
+        """Display cashflow summary with enhanced formatting"""
+        try:
+            # Ensure cashflow_df has the necessary columns
+            required_columns = ['cash_flow_date', 'cash_flow_amount']
+            if not all(col in cashflow_df.columns for col in required_columns):
+                st.error("Cashflow data missing required columns")
+                return
+            
+            # Convert date column to datetime if it's not already
+            if 'cash_flow_date' in cashflow_df.columns:
+                cashflow_df['cash_flow_date'] = pd.to_datetime(cashflow_df['cash_flow_date'])
+                
+            # Sort by date
+            cashflow_df = cashflow_df.sort_values('cash_flow_date')
+            
+            # Display summary statistics
+            total_cashflow = cashflow_df['cash_flow_amount'].sum()
+            avg_cashflow = cashflow_df['cash_flow_amount'].mean()
+            
+            col1, col2 = st.columns(2)
+            col1.metric("Total Cashflow", f"{total_cashflow:,.2f}")
+            col2.metric("Average Cashflow", f"{avg_cashflow:,.2f}")
+            
+            # Display cashflow timeline
+            st.subheader("Cashflow Timeline")
+            st.dataframe(
+                cashflow_df[['cash_flow_date', 'cash_flow_amount']].rename(
+                    columns={'cash_flow_date': 'Date', 'cash_flow_amount': 'Amount'}
+                ),
+                use_container_width=True
+            )
+            
+            # Display cashflow visualization
+            st.subheader("Cashflow Visualization")
+            chart_data = cashflow_df[['cash_flow_date', 'cash_flow_amount']].rename(
+                columns={'cash_flow_date': 'Date', 'cash_flow_amount': 'Amount'}
+            )
+            st.bar_chart(chart_data.set_index('Date'))
+            
+        except Exception as e:
+            st.error(f"Error displaying cashflow: {str(e)}")
 
 def main():
     """Main application function"""
@@ -445,7 +602,7 @@ def main():
             # Bond Data Explorer tab
             with tabs[0]:
                 st.subheader("Look up bond by ISIN")
-                isin_input = st.text_input("", key="isin_lookup")
+                isin_input = st.text_input("Enter ISIN code", key="isin_lookup", label_visibility="collapsed")
 
                 if isin_input:
                     with st.spinner("Looking up bond details..."):
@@ -480,8 +637,7 @@ def main():
                                 st.markdown("### Cashflow Details")
                                 cashflow_df = pd.DataFrame(cashflow_data)
 
-                                # Import cashflow display agent
-                                from agents.cashflow_display_agent import CashflowDisplayAgent
+                                # Create cashflow display agent
                                 cashflow_display = CashflowDisplayAgent()
 
                                 # Display cashflow with enhanced formatting
@@ -493,7 +649,8 @@ def main():
             with tabs[1]:
                 query = st.text_input(
                     "Ask about bonds, companies, or market trends",
-                    placeholder="e.g., Show details for ISIN INE001A01001 or Find bonds with yield above 8%"
+                    placeholder="e.g., Show details for ISIN INE001A01001 or Find bonds with yield above 8%",
+                    label_visibility="collapsed"
                 )
 
                 if query:
