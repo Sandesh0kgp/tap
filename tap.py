@@ -145,34 +145,6 @@ def process_json_columns(df: pd.DataFrame, json_columns: List[str]) -> pd.DataFr
                 json.loads(x) if isinstance(x, str) and x.strip() else {})
     return df
 
-def load_data(bond_files, cashflow_file, company_file) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Dict]]:
-    """Load all data files with error handling"""
-    status = {
-        "bond": {"status": "not_started", "message": ""},
-        "cashflow": {"status": "not_started", "message": ""},
-        "company": {"status": "not_started", "message": ""}
-    }
-
-    try:
-        # Process bond files
-        bond_dfs = []
-        if bond_files and any(bond_files):
-            status["bond"]["status"] = "in_progress"
-
-            for i, bf in enumerate(bond_files):
-                if bf is None:
-                    continue
-
-                bond_path = save_uploadedfile(bf)
-                if bond_path:
-                    try:
-                        is_valid, validation_message = validate_csv_file(
-                            bond_path, ['isin', 'company_name']
-                        )
-                        if not is_valid:
-                            status["bond"]["status"] = "error"
-                            status["bond"]["message"] = f"Bond file {i+1}: {validation_message}"
-
 def lookup_bond_by_isin(isin: str) -> Dict:
     """Look up bond details by ISIN"""
     try:
@@ -219,6 +191,33 @@ def lookup_bond_by_isin(isin: str) -> Dict:
         logger.error(f"Error looking up bond: {str(e)}")
         return {"error": f"Error looking up bond: {str(e)}"}
 
+def load_data(bond_files, cashflow_file, company_file) -> Tuple[Optional[pd.DataFrame], Optional[pd.DataFrame], Optional[pd.DataFrame], Dict[str, Dict]]:
+    """Load all data files with error handling"""
+    status = {
+        "bond": {"status": "not_started", "message": ""},
+        "cashflow": {"status": "not_started", "message": ""},
+        "company": {"status": "not_started", "message": ""}
+    }
+
+    try:
+        # Process bond files
+        bond_dfs = []
+        if bond_files and any(bond_files):
+            status["bond"]["status"] = "in_progress"
+
+            for i, bf in enumerate(bond_files):
+                if bf is None:
+                    continue
+
+                bond_path = save_uploadedfile(bf)
+                if bond_path:
+                    try:
+                        is_valid, validation_message = validate_csv_file(
+                            bond_path, ['isin', 'company_name']
+                        )
+                        if not is_valid:
+                            status["bond"]["status"] = "error"
+                            status["bond"]["message"] = f"Bond file {i+1}: {validation_message}"
                             continue
 
                         df = pd.read_csv(bond_path)
@@ -535,41 +534,41 @@ def main():
                 )
                 
                 if query:
-                # Initialize LLM
-                llm = get_llm(api_key, model_option)
-                if not llm:
-                    st.error("Please provide a valid GROQ API key to continue.")
-                    return
+                    # Initialize LLM
+                    llm = get_llm(api_key, model_option)
+                    if not llm:
+                        st.error("Please provide a valid GROQ API key to continue.")
+                        return
 
-                with st.spinner("Processing your query..."):
-                    # Process query
-                    context = {
-                        "bond_data": st.session_state.bond_details,
-                        "cashflow_data": st.session_state.cashflow_details,
-                        "company_data": st.session_state.company_insights
-                    }
+                    with st.spinner("Processing your query..."):
+                        # Process query
+                        context = {
+                            "bond_data": st.session_state.bond_details,
+                            "cashflow_data": st.session_state.cashflow_details,
+                            "company_data": st.session_state.company_insights
+                        }
 
-                    result = process_query(query, context, llm)
+                        result = process_query(query, context, llm)
 
-                    if "error" in result:
-                        st.error(result["error"])
-                    else:
-                        # Display AI response
-                        st.markdown("### Analysis")
-                        st.markdown(result["response"])
+                        if "error" in result:
+                            st.error(result["error"])
+                        else:
+                            # Display AI response
+                            st.markdown("### Analysis")
+                            st.markdown(result["response"])
 
-                        # Display web search results
-                        if result.get("web_results"):
-                            with st.expander("Web Search Results"):
-                                for i, r in enumerate(result["web_results"], 1):
-                                    st.markdown(f"**{i}. [{r['title']}]({r['link']})**")
-                                    st.markdown(r['snippet'])
+                            # Display web search results
+                            if result.get("web_results"):
+                                with st.expander("Web Search Results"):
+                                    for i, r in enumerate(result["web_results"], 1):
+                                        st.markdown(f"**{i}. [{r['title']}]({r['link']})**")
+                                        st.markdown(r['snippet'])
 
-                        # Add to chat history
-                        st.session_state.chat_history.append({
-                            "query": query,
-                            "response": result["response"]
-                        })
+                            # Add to chat history
+                            st.session_state.chat_history.append({
+                                "query": query,
+                                "response": result["response"]
+                            })
 
             # Display chat history
             if st.session_state.chat_history:
