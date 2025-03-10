@@ -285,60 +285,89 @@ class DataLoader:
             ]
         return self.company_insights
         
-    def import_cashflow_from_text(self, text_data: str) -> Tuple[Optional[pd.DataFrame], Dict]:
-        """Import cashflow data from formatted text"""
+    def lookup_bond_by_isin(self, isin: str) -> Dict:
+        """Look up bond details by ISIN with structured output"""
         try:
-            # Parse the text into rows
-            lines = text_data.strip().split('\n')
-            
-            # Extract header and data rows
-            header_line = None
-            data_rows = []
-            for i, line in enumerate(lines):
-                if '\t' in line:
-                    # Check if this is likely a header row
-                    if any(keyword in line for keyword in ['Cashflow Date', 'Cashflow', 'Principal Amount']):
-                        header_line = i
-                        break
-            
-            if header_line is None:
-                return None, {"status": "error", "message": "Could not identify header row in the data"}
-            
-            # Parse the header
-            headers = lines[header_line].split('\t')
-            
-            # Parse the data rows
-            data = []
-            for i in range(header_line + 1, len(lines)):
-                if '\t' in lines[i]:
-                    data.append(lines[i].split('\t'))
-            
-            # Create dataframe
-            df = pd.DataFrame(data)
-            if len(df.columns) >= len(headers):
-                df = df.iloc[:, :len(headers)]
-                df.columns = headers
+            if self.bond_details is None:
+                return {"error": "Bond data not loaded"}
                 
-                # Clean and convert data types
-                for col in df.columns:
-                    if 'Date' in col:
-                        df[col] = pd.to_datetime(df[col], errors='coerce')
-                    elif any(amount in col for amount in ['Amount', 'Cashflow']):
-                        df[col] = pd.to_numeric(df[col], errors='coerce')
+            # Try exact match
+            matching_bonds = self.bond_details[self.bond_details['isin'] == isin]
+            
+            if matching_bonds.empty:
+                # Try partial match
+                matching_bonds = self.bond_details[self.bond_details['isin'].str.contains(isin, case=False, na=False)]
+            
+            if matching_bonds.empty:
+                return {"error": f"No bond found with ISIN: {isin}"}
                 
-                # Extract bond details from text
-                bond_details = {}
-                for i in range(header_line):
-                    if '\t' in lines[i]:
-                        parts = lines[i].split('\t')
-                        if len(parts) >= 2 and parts[0] and parts[1]:
-                            key, value = parts[0], parts[1]
-                            bond_details[key] = value
-                            
-                return df, {"status": "success", "message": f"Loaded {len(df)} cashflow records", "bond_details": bond_details}
+            # Get primary bond data
+            bond_data = matching_bonds.iloc[0].to_dict()
             
-            return None, {"status": "error", "message": "Failed to parse data structure"}
+            # Get cashflow data if available
+            cashflow_data = None
+            if self.cashflow_details is not None:
+                cashflow = self.cashflow_details[
+                    self.cashflow_details['isin'] == matching_bonds.iloc[0]['isin']
+                ]
+                
+                if not cashflow.empty:
+                    # Convert date columns
+                    for col in ['cash_flow_date', 'record_date']:
+                        if col in cashflow.columns:
+                            cashflow[col] = pd.to_datetime(cashflow[col]).dt.strftime('%d-%b-%Y')
+                    
+                    # Format numeric columns
+                    for col in ['cash_flow_amount', 'principal_amount', 'interest_amount']:
+                        if col in cashflow.columns:
+                            cashflow[col] = cashflow[col].apply(lambda x: float(x) if pd.notnull(x) else 0)
+                    
+                    # Sort by date if possible
+                    if 'cash_flow_date' in cashflow.columns:
+                        cashflow['date_for_sort'] = pd.to_datetime(cashflow['cash_flow_date'], format='%d-%b-%Y')
+                        cashflow = cashflow.sort_values('date_for_sort')
+                        cashflow = cashflow.drop('date_for_sort', axis=1)
+                    
+                    # Format as structured records
+                    cashflow_data = cashflow.to_dict('records')
+                    
+                    # Calculate summary metrics
+                    metrics = {
+                        "total_cashflow": sum(cf.get('cash_flow_amount', 0) for cf in cashflow_data),
+                        "total_principal": sum(cf.get('principal_amount', 0) for cf in cashflow_data),
+                        "total_interest": sum(cf.get('interest_amount', 0) for cf in cashflow_data),
+                        "payment_count": len(cashflow_data)
+                    }
+                    
+                    # Extract key details from bond data for summary
+                    bond_summary = {}
+                    for key in ['isin', 'issuer', 'face_value', 'trade_fv', 'units', 'trade_date', 'ytm', 'coupon']:
+                        if key in bond_data:
+                            bond_summary[key] = bond_data[key]
+                        
+                    # Create structured response
+                    return {
+                        "bond_data": bond_data,
+                        "bond_summary": bond_summary,
+                        "cashflow_data": cashflow_data,
+                        "cashflow_metrics": metrics,
+                        "success": True
+                    }
             
+            # Get company data if available
+            company_data = None
+            if self.company_insights is not None and 'company_name' in bond_data:
+                company = self.company_insights[
+                    self.company_insights['company_name'] == bond_data['company_name']
+                ]
+                if not company.empty:
+                    company_data = company.iloc[0].to_dict()
+            
+            return {
+                "bond_data": bond_data,
+                "company_data": company_data,
+                "success": True
+            }
         except Exception as e:
-            self.logger.error(f"Error importing cashflow from text: {str(e)}")
-            return None, {"status": "error", "message": f"Error importing cashflow from text: {str(e)}"}
+            self.logger.error(f"Error looking up bond: {str(e)}")
+            return {"error": f"Error looking up bond: {str(e)}", "success": False}
