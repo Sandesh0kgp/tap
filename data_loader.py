@@ -1,4 +1,3 @@
-
 import pandas as pd
 import logging
 from typing import Optional, Dict, List, Tuple
@@ -36,17 +35,14 @@ class DataLoader:
             # Process bond files
             if bond_files and any(bond_files):
                 bond_details, status["bond"] = self._process_bond_files(bond_files)
-                self.bond_details = bond_details
 
             # Process cashflow file
             if cashflow_file:
                 cashflow_details, status["cashflow"] = self._process_cashflow_file(cashflow_file)
-                self.cashflow_details = cashflow_details
 
             # Process company file
             if company_file:
                 company_insights, status["company"] = self._process_company_file(company_file)
-                self.company_insights = company_insights
 
         except Exception as e:
             self.logger.error(f"Error in load_data: {str(e)}")
@@ -253,8 +249,7 @@ class DataLoader:
         """Process JSON columns in DataFrame"""
         json_columns = [
             'coupon_details', 'issuer_details', 'instrument_details',
-            'redemption_details', 'credit_rating_details', 'listing_details',
-            'key_contact_details', 'key_documents_details'
+            'redemption_details', 'credit_rating_details', 'listing_details'
         ]
 
         for col in json_columns:
@@ -289,48 +284,61 @@ class DataLoader:
                 )
             ]
         return self.company_insights
-
-    def lookup_bond_by_isin(self, isin: str) -> Dict:
-        """Look up bond details by ISIN"""
+        
+    def import_cashflow_from_text(self, text_data: str) -> Tuple[Optional[pd.DataFrame], Dict]:
+        """Import cashflow data from formatted text"""
         try:
-            if self.bond_details is None:
-                return {"error": "Bond data not loaded"}
-                
-            # Try exact match
-            matching_bonds = self.bond_details[self.bond_details['isin'] == isin]
+            # Parse the text into rows
+            lines = text_data.strip().split('\n')
             
-            if matching_bonds.empty:
-                # Try partial match
-                matching_bonds = self.bond_details[self.bond_details['isin'].str.contains(isin, case=False, na=False)]
+            # Extract header and data rows
+            header_line = None
+            data_rows = []
+            for i, line in enumerate(lines):
+                if '\t' in line:
+                    # Check if this is likely a header row
+                    if any(keyword in line for keyword in ['Cashflow Date', 'Cashflow', 'Principal Amount']):
+                        header_line = i
+                        break
             
-            if not matching_bonds.empty:
-                bond_data = matching_bonds.iloc[0].to_dict()
-                
-                # Get cashflow data if available
-                cashflow_data = None
-                if self.cashflow_details is not None:
-                    cashflow = self.cashflow_details[
-                        self.cashflow_details['isin'] == matching_bonds.iloc[0]['isin']
-                    ]
-                    if not cashflow.empty:
-                        cashflow_data = cashflow.to_dict('records')
-                
-                # Get company data if available
-                company_data = None
-                if self.company_insights is not None:
-                    company = self.company_insights[
-                        self.company_insights['company_name'] == matching_bonds.iloc[0]['company_name']
-                    ]
-                    if not company.empty:
-                        company_data = company.iloc[0].to_dict()
-                
-                return {
-                    "bond_data": bond_data,
-                    "cashflow_data": cashflow_data,
-                    "company_data": company_data
-                }
+            if header_line is None:
+                return None, {"status": "error", "message": "Could not identify header row in the data"}
             
-            return {"error": f"No bond found with ISIN: {isin}"}
+            # Parse the header
+            headers = lines[header_line].split('\t')
+            
+            # Parse the data rows
+            data = []
+            for i in range(header_line + 1, len(lines)):
+                if '\t' in lines[i]:
+                    data.append(lines[i].split('\t'))
+            
+            # Create dataframe
+            df = pd.DataFrame(data)
+            if len(df.columns) >= len(headers):
+                df = df.iloc[:, :len(headers)]
+                df.columns = headers
+                
+                # Clean and convert data types
+                for col in df.columns:
+                    if 'Date' in col:
+                        df[col] = pd.to_datetime(df[col], errors='coerce')
+                    elif any(amount in col for amount in ['Amount', 'Cashflow']):
+                        df[col] = pd.to_numeric(df[col], errors='coerce')
+                
+                # Extract bond details from text
+                bond_details = {}
+                for i in range(header_line):
+                    if '\t' in lines[i]:
+                        parts = lines[i].split('\t')
+                        if len(parts) >= 2 and parts[0] and parts[1]:
+                            key, value = parts[0], parts[1]
+                            bond_details[key] = value
+                            
+                return df, {"status": "success", "message": f"Loaded {len(df)} cashflow records", "bond_details": bond_details}
+            
+            return None, {"status": "error", "message": "Failed to parse data structure"}
+            
         except Exception as e:
-            self.logger.error(f"Error looking up bond: {str(e)}")
-            return {"error": f"Error looking up bond: {str(e)}"}
+            self.logger.error(f"Error importing cashflow from text: {str(e)}")
+            return None, {"status": "error", "message": f"Error importing cashflow from text: {str(e)}"}
