@@ -491,7 +491,7 @@ def main():
             # Bond Data Explorer tab
             with tabs[0]:
                 st.subheader("Look up bond by ISIN")
-                isin_input = st.text_input("", key="isin_lookup")
+                isin_input = st.text_input("Enter ISIN", key="isin_lookup", label_visibility="collapsed")
                 
                 if isin_input:
                     with st.spinner("Looking up bond details..."):
@@ -530,7 +530,8 @@ def main():
             with tabs[1]:
                 query = st.text_input(
                     "Ask about bonds, companies, or market trends",
-                    placeholder="e.g., Show details for ISIN INE001A01001 or Find bonds with yield above 8%"
+                    placeholder="e.g., Show details for ISIN INE001A01001 or Find bonds with yield above 8%",
+                    label_visibility="collapsed"
                 )
                 
                 if query:
