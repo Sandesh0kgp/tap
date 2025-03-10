@@ -85,14 +85,16 @@ def fetch_web_content(url: str) -> str:
         soup = BeautifulSoup(response.text, 'html.parser')
         h = html2text.HTML2Text()
         h.ignore_links = True
-        return h.handle(soup.get_text())
+        # Limit the content length to reduce token usage
+        content = h.handle(soup.get_text())
+        return content[:5000]  # Limit content length to 5000 chars
     except Exception as e:
         logger.error(f"Error fetching web content: {str(e)}")
         return ""
 
 @st.cache_data(ttl=3600)
-def perform_web_search(query: str, num_results: int = 3) -> List[Dict]:
-    """Perform web search with content fetching"""
+def perform_web_search(query: str, num_results: int = 2) -> List[Dict]:
+    """Perform web search with content fetching - reduced results"""
     try:
         search = DuckDuckGoSearchAPIWrapper()
         results = search.results(query, num_results)
@@ -108,7 +110,7 @@ def perform_web_search(query: str, num_results: int = 3) -> List[Dict]:
                 }
             enhanced_results.append({
                 **result,
-                "content": st.session_state.web_cache[result["link"]]["content"]
+                "content": st.session_state.web_cache[result["link"]]["content"][:2000]  # Further limit content
             })
         return enhanced_results
     except Exception as e:
@@ -146,7 +148,7 @@ def process_json_columns(df: pd.DataFrame, json_columns: List[str]) -> pd.DataFr
     return df
 
 def lookup_bond_by_isin(isin: str) -> Dict:
-    """Look up bond details by ISIN - Improved version with better partial matching"""
+    """Look up bond details by ISIN"""
     try:
         if st.session_state.bond_details is None:
             return {"error": "Bond data not loaded"}
@@ -333,14 +335,55 @@ def get_llm(api_key: str, model: str = "llama3-70b-8192"):
             api_key=api_key,
             model=model,
             temperature=0.2,
-            max_tokens=4000
+            max_tokens=3000
         )
     except Exception as e:
         logger.error(f"Error initializing LLM: {str(e)}")
         return None
 
+def extract_bond_summary(data: Dict) -> str:
+    """Extract a summarized version of bond data to reduce token usage"""
+    if not data or "bond_data" not in data:
+        return "No specific bond data found"
+    
+    bond = data["bond_data"]
+    summary = {
+        "isin": bond.get("isin", "N/A"),
+        "company_name": bond.get("company_name", "N/A"),
+        "issue_size": bond.get("issue_size", "N/A"),
+        "maturity_date": bond.get("maturity_date", "N/A"),
+        "coupon_rate": bond.get("coupon_rate", "N/A")
+    }
+    
+    # Add a few additional fields if they exist
+    for key in ["bond_type", "rating", "listing_status", "industry"]:
+        if key in bond:
+            summary[key] = bond[key]
+            
+    return json.dumps(summary, indent=2)
+
+def extract_cashflow_summary(data: List) -> str:
+    """Extract a summarized version of cashflow data to reduce token usage"""
+    if not data:
+        return "No specific cashflow data found"
+    
+    # Return only the first 3 cashflows
+    limited_data = data[:3]
+    summarized = []
+    
+    for cf in limited_data:
+        summary = {
+            "isin": cf.get("isin", "N/A"),
+            "cash_flow_date": cf.get("cash_flow_date", "N/A"),
+            "cash_flow_amount": cf.get("cash_flow_amount", "N/A"),
+            "cash_flow_type": cf.get("cash_flow_type", "N/A")
+        }
+        summarized.append(summary)
+    
+    return json.dumps(summarized, indent=2)
+
 def process_query(query: str, context: Dict, llm) -> Dict:
-    """Process query using LLM and available data"""
+    """Process query using LLM and available data (with optimized context)"""
     try:
         if not llm:
             return {"error": "AI model not initialized. Please check API key."}
@@ -348,13 +391,9 @@ def process_query(query: str, context: Dict, llm) -> Dict:
         # Check if query is about a specific bond (ISIN lookup)
         isin_query = query.strip().upper()
         specific_bond_data = None
-        specific_cashflow_data = None
-        
-        bond_df = context.get("bond_data")
-        cashflow_df = context.get("cashflow_data")
         
         # If query looks like an ISIN or contains ISIN-like pattern, try to extract specific bond data
-        if (len(isin_query) >= 5 and bond_df is not None) or "ISIN" in isin_query:
+        if (len(isin_query) >= 5 and "bond_data" in context) or "ISIN" in isin_query:
             # Try to extract ISIN pattern if query contains words
             if "ISIN" in isin_query:
                 import re
@@ -362,63 +401,59 @@ def process_query(query: str, context: Dict, llm) -> Dict:
                 if isin_pattern:
                     isin_query = isin_pattern.group(0)
             
-            # Try exact match first
-            if isin_query in bond_df['isin'].values:
-                specific_bond_data = bond_df[bond_df['isin'] == isin_query].to_dict('records')
-                if cashflow_df is not None:
-                    specific_cashflow_data = cashflow_df[cashflow_df['isin'] == isin_query].to_dict('records')
-            # Try partial match
-            else:
-                # For each character in the search term, gradually build potential matches
-                min_match_length = min(5, len(isin_query))  # At least 5 chars or full ISIN if shorter
-                for i in range(min_match_length, len(isin_query) + 1):
-                    partial_isin = isin_query[:i]
-                    matching_bonds = bond_df[bond_df['isin'].str.contains(partial_isin, case=False, na=False)]
-                    if not matching_bonds.empty:
-                        specific_bond_data = matching_bonds.to_dict('records')
-                        if cashflow_df is not None:
-                            matching_isins = matching_bonds['isin'].tolist()
-                            specific_cashflow_data = cashflow_df[cashflow_df['isin'].isin(matching_isins)].to_dict('records')
-                        break
+            # Use the lookup function
+            specific_bond_data = lookup_bond_by_isin(isin_query)
 
-        # Perform web search for additional context
-        web_results = perform_web_search(query)
-        web_context = "\n".join(result.get("content", "") for result in web_results)
-
-        # Create enhanced prompt
+        # Perform web search for additional context - limited to reduce tokens
+        web_results = perform_web_search(query, num_results=1)  # Reduced from 3 to 1
+        
+        # Extract only snippets from web results instead of full content
+        web_snippets = []
+        for result in web_results:
+            web_snippets.append({
+                "title": result.get("title", ""),
+                "snippet": result.get("snippet", "")
+            })
+        
+        # Create optimized prompt with much less context
         template = """You are a financial expert specializing in bond analysis.
 
         User Query: {query}
 
-        Available Data:
-        Bond Data: {bond_data}
-        Cashflow Data: {cashflow_data}
-        Company Data: {company_data}
-        
-        Specific Bond Data: {specific_bond_data}
-        Specific Cashflow Data: {specific_cashflow_data}
+        {specific_bond_info}
 
-        Additional Web Context:
-        {web_context}
+        {web_info}
 
-        Please provide a comprehensive analysis based on all available information.
+        Please provide a concise analysis based on the available information.
         Format your response using Markdown for better readability.
-        Include relevant web information when appropriate.
-        If the user is looking for a specific bond by ISIN, make sure to include all relevant details
-        about that bond including issuer, coupon rate, maturity, and other key information.
+        If the user is looking for a specific bond by ISIN, focus on providing key details.
         """
+
+        # Prepare specific bond info
+        specific_bond_info = ""
+        if specific_bond_data and "error" not in specific_bond_data:
+            specific_bond_info = f"""
+            Specific Bond Information:
+            {extract_bond_summary(specific_bond_data)}
+            
+            Cashflow Information:
+            {extract_cashflow_summary(specific_bond_data.get('cashflow_data', []))}
+            """
+        
+        # Prepare web info
+        web_info = ""
+        if web_snippets:
+            web_info = "Relevant Web Information:\n"
+            for i, result in enumerate(web_snippets):
+                web_info += f"Source {i+1}: {result['title']}\n{result['snippet']}\n\n"
 
         prompt = ChatPromptTemplate.from_template(template)
         chain = prompt | llm | StrOutputParser()
 
         response = chain.invoke({
             "query": query,
-            "bond_data": str(context.get("bond_data").head(5)) if bond_df is not None else "No bond data available",
-            "cashflow_data": str(context.get("cashflow_data").head(5)) if cashflow_df is not None else "No cashflow data available",
-            "company_data": str(context.get("company_data").head(5)) if context.get("company_data") is not None else "No company data available",
-            "specific_bond_data": str(specific_bond_data) if specific_bond_data else "No specific bond data found",
-            "specific_cashflow_data": str(specific_cashflow_data) if specific_cashflow_data else "No specific cashflow data found",
-            "web_context": web_context
+            "specific_bond_info": specific_bond_info,
+            "web_info": web_info
         })
 
         return {
